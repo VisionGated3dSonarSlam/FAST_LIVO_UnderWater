@@ -114,6 +114,13 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
+bool auxiliary_fusion_enabled = false;
+
+constexpr double AUX_SENSOR_REORDER_WINDOW_SEC = 0.02;
+constexpr auto AUX_SENSOR_REORDER_WALL_GRACE = std::chrono::milliseconds(20);
+bool aux_reorder_waiting = false;
+double aux_reorder_target_time = -1.0;
+std::chrono::steady_clock::time_point aux_reorder_wait_start;
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -159,9 +166,6 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
-AuxiliarySensorFusion *g_joint_aux_fusion = nullptr;
-AuxiliarySensorFusion::JointMeasurementSet g_joint_aux_measurements;
-bool g_joint_aux_update_active = false;
 
 void SigHandle(int sig)
 {
@@ -286,9 +290,15 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    mtx_buffer.lock();
+    const double cur_time = get_time_sec(msg->header.stamp);
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    // Point-cloud conversion is intentionally outside the shared sensor-buffer
+    // lock and in its own callback group. Large sonar messages must not starve
+    // IMU and auxiliary callbacks during accelerated rosbag replay.
+    p_pre->process(msg, ptr);
+
+    std::lock_guard<std::mutex> lock(mtx_buffer);
     scan_count ++;
-    double cur_time = get_time_sec(msg->header.stamp);
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         lidar_buffer.clear();
@@ -298,13 +308,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         is_first_lidar = false;
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    obs_manager.notify_sonar_scan(cur_time);
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
 
@@ -350,6 +356,38 @@ double imu_only_packet_duration()
     return std::max(5.0 * expected_imu_period(), std::min(lidar_timeout, 0.25));
 }
 
+bool auxiliary_callbacks_ready(double target_time, double latest_imu_time)
+{
+    if (!auxiliary_fusion_enabled)
+    {
+        aux_reorder_waiting = false;
+        aux_reorder_target_time = -1.0;
+        return true;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!aux_reorder_waiting ||
+        std::abs(aux_reorder_target_time - target_time) > 1e-6)
+    {
+        aux_reorder_waiting = true;
+        aux_reorder_target_time = target_time;
+        aux_reorder_wait_start = now;
+    }
+
+    const bool sensor_time_ready =
+        latest_imu_time >= target_time + AUX_SENSOR_REORDER_WINDOW_SEC;
+    const bool wall_time_ready =
+        now - aux_reorder_wait_start >= AUX_SENSOR_REORDER_WALL_GRACE;
+    if (!sensor_time_ready && !wall_time_ready)
+    {
+        return false;
+    }
+
+    aux_reorder_waiting = false;
+    aux_reorder_target_time = -1.0;
+    return true;
+}
+
 bool sync_packages(MeasureGroup &meas)
 {
     while (!lidar_pushed && !lidar_buffer.empty() && last_processed_time > 0.0 &&
@@ -392,6 +430,10 @@ bool sync_packages(MeasureGroup &meas)
     {
         return false;
     }
+    if (!auxiliary_callbacks_ready(lidar_end_time, last_timestamp_imu))
+    {
+        return false;
+    }
 
     /*** push imu data, and pop from imu buffer ***/
     double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
@@ -407,19 +449,25 @@ bool sync_packages(MeasureGroup &meas)
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+    obs_manager.notify_sonar_scan(meas.lidar_end_time);
     return true;
 }
 
 bool sync_imu_only_packages(MeasureGroup &meas)
 {
-    if (!lidar_buffer.empty() || lidar_pushed || imu_buffer.empty()) {
+    // An empty topic explicitly selects INS mode. Preserve the established
+    // misspelled/unavailable-topic test as well: if no LiDAR message has ever
+    // arrived, propagate IMU and auxiliary measurements without scans. Once a
+    // real LiDAR stream has started, temporary gaps remain scan-bounded so a
+    // delayed scan cannot become an out-of-sequence measurement.
+    const bool explicit_ins_mode = lid_topic.empty();
+    const bool no_lidar_received = is_first_lidar;
+    if ((!explicit_ins_mode && !no_lidar_received) ||
+        !lidar_buffer.empty() || lidar_pushed || imu_buffer.empty()) {
         return false;
     }
 
     const double latest_imu_time = get_time_sec(imu_buffer.back()->header.stamp);
-    if (last_timestamp_lidar > 0.0 && latest_imu_time - last_timestamp_lidar < lidar_timeout) {
-        return false;
-    }
     if (last_processed_time > 0.0 && latest_imu_time <= last_processed_time + 1e-6) {
         return false;
     }
@@ -433,6 +481,10 @@ bool sync_imu_only_packages(MeasureGroup &meas)
     }
     const double target_packet_end_time = packet_begin_time + imu_only_packet_duration();
     if (latest_imu_time < target_packet_end_time - 1e-6)
+    {
+        return false;
+    }
+    if (!auxiliary_callbacks_ready(target_packet_end_time, latest_imu_time))
     {
         return false;
     }
@@ -949,20 +1001,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     double solve_start_  = omp_get_wtime();
     
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-    const int max_joint_aux_rows =
-        (g_joint_aux_update_active && g_joint_aux_fusion) ? g_joint_aux_measurements.max_rows() : 0;
-    const int max_rows = effct_feat_num + max_joint_aux_rows;
-    if (max_rows < 1)
+    if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
         return;
     }
-    // Preserve the original FAST-LIO2 12-column LiDAR Jacobian and solver
-    // exactly when this scan has no DVL or pressure rows. The expanded state
-    // Jacobian is used only for a real joint auxiliary correction.
-    const int jacobian_cols = max_joint_aux_rows > 0 ? state_ikfom::DOF : 12;
-    ekfom_data.h_x = MatrixXd::Zero(max_rows, jacobian_cols);
-    ekfom_data.h = Eigen::VectorXd::Zero(max_rows);
+    // Auxiliary measurements are already applied at their own timestamps.
+    // Keep the original FAST-LIO2 scan-to-map update layout here.
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);
+    ekfom_data.h = Eigen::VectorXd::Zero(effct_feat_num);
 
     for (int i = 0; i < effct_feat_num; i++)
     {
@@ -984,31 +1031,22 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
 
-        // The point-to-plane residual constrains motion along the map normal:
-        // horizontal/seabed normals mainly constrain z, vertical-wall normals
-        // mainly constrain xy. Whiten each row so LiDAR z can be tuned
-        // independently from LiDAR xy without changing IKFoM's scalar-R API.
-        const double nz2 = std::clamp(static_cast<double>(norm_p.z) * static_cast<double>(norm_p.z), 0.0, 1.0);
-        const double point_cov = std::max(1e-12, LASER_POINT_COV_XY * (1.0 - nz2) + LASER_POINT_COV_Z * nz2);
-        const double inv_sigma = 1.0 / std::sqrt(point_cov);
-        ekfom_data.h_x.block<1, 12>(i, 0) *= inv_sigma;
-        ekfom_data.h(i) *= inv_sigma;
+        if (auxiliary_fusion_enabled)
+        {
+            // The underwater path supports separate horizontal and vertical
+            // scan covariance by whitening each point-to-plane residual.
+            const double nz2 = std::clamp(
+                static_cast<double>(norm_p.z) * static_cast<double>(norm_p.z),
+                0.0, 1.0);
+            const double point_cov = std::max(
+                1e-12, LASER_POINT_COV_XY * (1.0 - nz2) +
+                           LASER_POINT_COV_Z * nz2);
+            const double inv_sigma = 1.0 / std::sqrt(point_cov);
+            ekfom_data.h_x.block<1, 12>(i, 0) *= inv_sigma;
+            ekfom_data.h(i) *= inv_sigma;
+        }
     }
 
-    int total_rows = effct_feat_num;
-    if (g_joint_aux_update_active && g_joint_aux_fusion)
-    {
-        total_rows = g_joint_aux_fusion->append_joint_measurement_rows(
-            g_joint_aux_measurements, s, kf.get_P(),
-            ekfom_data.h_x, ekfom_data.h, total_rows);
-    }
-    if (total_rows < 1)
-    {
-        ekfom_data.valid = false;
-        return;
-    }
-    ekfom_data.h_x.conservativeResize(total_rows, Eigen::NoChange);
-    ekfom_data.h.conservativeResize(total_rows);
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -1142,7 +1180,9 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         aux_fusion_.load_parameters(*this);
-        g_joint_aux_fusion = &aux_fusion_;
+        auxiliary_fusion_enabled = aux_fusion_.dvl_enabled() ||
+                                   aux_fusion_.pressure_enabled() ||
+                                   aux_fusion_.mag_enabled();
         if (imu_rate_hz <= 0.0)
         {
             RCLCPP_WARN(this->get_logger(), "common.imu_rate_hz must be positive. Falling back to 100 Hz.");
@@ -1166,7 +1206,9 @@ public:
         // else: init_b_acc_cov / init_b_gyr_cov / init_grav_cov already loaded from YAML above.
         const double disabled_aux_cov = 1e-12;
         init_b_dvl_cov = aux_fusion_.dvl_enabled() ? aux_fusion_.dvl_b_init_cov() : disabled_aux_cov;
-        init_b_pressure_cov = aux_fusion_.pressure_enabled() ? 1e4 : disabled_aux_cov;
+        init_b_pressure_cov = aux_fusion_.pressure_enabled()
+                                  ? aux_fusion_.pressure_b_init_cov()
+                                  : disabled_aux_cov;
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -1220,9 +1262,12 @@ public:
 
         /*** ROS subscribe initialization ***/
         sensor_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        lidar_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         processing_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         rclcpp::SubscriptionOptions sensor_options;
         sensor_options.callback_group = sensor_callback_group_;
+        rclcpp::SubscriptionOptions lidar_options;
+        lidar_options.callback_group = lidar_callback_group_;
 
         if (lid_topic.empty())
         {
@@ -1232,9 +1277,9 @@ public:
         else
         {
             auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(200000));
-            lidar_qos.best_effort();
+            lidar_qos.reliability_best_available();
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                lid_topic, lidar_qos, standard_pcl_cbk, sensor_options);
+                lid_topic, lidar_qos, standard_pcl_cbk, lidar_options);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(rclcpp::KeepLast(200000)), imu_cbk, sensor_options);
@@ -1336,7 +1381,7 @@ private:
             t0 = omp_get_wtime();
 
             const double process_begin_time = last_processed_time > 0.0 ? last_processed_time : Measures.lidar_beg_time;
-            if (!noiseless_imu)
+            if (!noiseless_imu && auxiliary_fusion_enabled)
             {
                 const double now = Measures.lidar_end_time;
                 const double dyn_bg = obs_manager.bg_cov(now);
@@ -1347,44 +1392,67 @@ private:
             if (!p_imu->IsInitialized())
             {
                 p_imu->Process(Measures, kf, feats_undistort);
+                if (p_imu->IsInitialized() && auxiliary_fusion_enabled)
+                {
+                    aux_fusion_.initialize_pressure_reference_pose(kf.get_x());
+                }
                 last_processed_time = Measures.lidar_end_time;
                 update_state_outputs();
                 return;
             }
 
             AuxiliarySensorFusion::UpdateSummary aux_summary;
-            auto apply_aux_updates = [&]() {
-                aux_summary.merge(aux_fusion_.process_interval(
-                    process_begin_time, Measures.lidar_end_time, Measures.imu, kf));
-                aux_summary.merge(aux_fusion_.process_magnetometer_interval(
-                    process_begin_time, Measures.lidar_end_time, kf));
-                aux_fusion_.warn_timeouts(*this, Measures.lidar_end_time);
-            };
-
-            if (imu_only_measure)
+            if (!auxiliary_fusion_enabled)
             {
-                auto propagate_to = [&](double target_time) {
-                    return p_imu->PartialPropagate(target_time, kf, Measures.imu);
+                // This is the original FAST-LIO2 path: one scan-bounded IMU
+                // propagation/deskew and no extra attitude or auxiliary update.
+                p_imu->Process(Measures, kf, feats_undistort);
+            }
+            else
+            {
+                aux_fusion_.initialize_pressure_reference_pose(kf.get_x());
+                const auto timed_measurements = aux_fusion_.take_timed_measurements(
+                    process_begin_time, Measures.lidar_end_time);
+                const auto late_measurements = aux_fusion_.take_late_measurement_counts();
+                if (aux_timeline_started_ && late_measurements.total() > 0)
+                {
+                    RCLCPP_WARN_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 5000,
+                        "Dropped out-of-sequence auxiliary measurements: DVL=%zu pressure=%zu magnetometer=%zu. "
+                        "Check sensor acquisition timestamps and transport latency.",
+                        late_measurements.dvl, late_measurements.pressure,
+                        late_measurements.magnetometer);
+                }
+                aux_timeline_started_ = true;
+                std::vector<double> timed_measurement_stamps;
+                timed_measurement_stamps.reserve(timed_measurements.size());
+                for (const auto &measurement : timed_measurements)
+                {
+                    timed_measurement_stamps.push_back(measurement.timestamp);
+                }
+
+                auto apply_timed_measurement =
+                    [&](std::size_t measurement_index, ImuProcess::Ekf &event_kf) -> bool
+                {
+                    return aux_fusion_.apply_timed_measurement(
+                        timed_measurements[measurement_index], Measures.imu,
+                        event_kf, aux_summary);
                 };
-                // With no scan correction, aux measurements are part of the
-                // propagation prior itself. Fuse them at their own timestamps;
-                // batching early magnetometer samples at the packet end can
-                // inject a false startup heading when the vehicle is moving.
-                aux_summary = aux_fusion_.process_interval_interleaved(
-                    process_begin_time, Measures.lidar_end_time, Measures.imu, kf,
-                    propagate_to);
-                p_imu->PartialPropagate(Measures.lidar_end_time, kf, Measures.imu);
+
+                p_imu->Process(Measures, kf, feats_undistort,
+                               timed_measurement_stamps, apply_timed_measurement);
                 if (!Measures.imu.empty())
                 {
-                    // Interpret a valid absolute IMU quaternion relative to
-                    // startup so its external frame cannot inject an initial
-                    // heading or tilt into FAST-LIO's local estimation frame.
                     apply_imu_orientation_update(Measures.imu.back());
                     apply_accel_attitude_update(Measures.imu.back());
                 }
-                last_processed_time = Measures.lidar_end_time;
                 aux_fusion_.warn_timeouts(*this, Measures.lidar_end_time);
-                update_state_outputs();
+            }
+            last_processed_time = Measures.lidar_end_time;
+            update_state_outputs();
+
+            if (imu_only_measure)
+            {
                 if (lid_topic.empty())
                 {
                     // Intentional no-lidar mode. Startup already reported this once.
@@ -1410,19 +1478,8 @@ private:
                 return;
             }
 
-            p_imu->Process(Measures, kf, feats_undistort);
-            last_processed_time = Measures.lidar_end_time;
-            if (!Measures.imu.empty())
-            {
-                apply_imu_orientation_update(Measures.imu.back());
-                apply_accel_attitude_update(Measures.imu.back());
-            }
-            update_state_outputs();
-
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
-                apply_aux_updates();
-                update_state_outputs();
                 RCLCPP_WARN(this->get_logger(), "No point, publish IMU-only odometry for this scan.\n");
                 g_publish_mode = aux_summary.updated() ? "aux_only" : "no_points";
                 publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
@@ -1453,8 +1510,6 @@ private:
                     }
                     ikdtree.Build(feats_down_world->points);
                 }
-                apply_aux_updates();
-                update_state_outputs();
                 g_publish_mode = "kdtree_init";
                 publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
                 return;
@@ -1465,8 +1520,6 @@ private:
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
-                apply_aux_updates();
-                update_state_outputs();
                 RCLCPP_WARN(this->get_logger(), "Too few points, publish IMU-only odometry for this scan.\n");
                 g_publish_mode = aux_summary.updated() ? "aux_only" : "few_points";
                 publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
@@ -1486,19 +1539,9 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
-            state_ikfom state_before_lidar = kf.get_x();
-            g_joint_aux_measurements = aux_fusion_.take_joint_measurements(
-                process_begin_time, Measures.lidar_end_time, Measures.imu);
-            aux_summary = aux_fusion_.summarize_joint_measurements(
-                g_joint_aux_measurements, state_before_lidar, kf.get_P());
-            g_joint_aux_update_active = g_joint_aux_measurements.max_rows() > 0;
-            kf.update_iterated_dyn_share_modified(1.0, solve_H_time);
-            g_joint_aux_update_active = false;
-            // Magnetometer is deliberately excluded from the joint scan/DVL/
-            // pressure residual. Apply one constrained scalar heading update to
-            // the corrected scan state, before publishing and map insertion.
-            aux_summary.merge(aux_fusion_.process_magnetometer_interval(
-                process_begin_time, Measures.lidar_end_time, kf));
+            const double lidar_update_cov =
+                auxiliary_fusion_enabled ? 1.0 : LASER_POINT_COV_XY;
+            kf.update_iterated_dyn_share_modified(lidar_update_cov, solve_H_time);
             update_state_outputs();
 
             double t_update_end = omp_get_wtime();
@@ -1540,6 +1583,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr lidar_callback_group_;
     rclcpp::CallbackGroup::SharedPtr processing_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -1548,6 +1592,7 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
+    bool aux_timeline_started_ = false;
     int effect_feat_num = 0;
     double deltaT, deltaR;
     bool flg_EKF_converged, EKF_stop_flg = 0;
@@ -1561,7 +1606,7 @@ int main(int argc, char** argv)
     signal(SIGINT, SigHandle);
 
     auto node = std::make_shared<LaserMappingNode>();
-    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
     executor.add_node(node);
     executor.spin();
 

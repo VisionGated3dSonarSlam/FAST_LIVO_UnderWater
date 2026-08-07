@@ -18,16 +18,20 @@
                                       0.0, 1.0, 0.0,
                                       0.0, 0.0, 1.0 ]
 
+            imu_rate_hz: 150.0
+            lidar_timeout: 0.25
             gravity_m_s2: 9.8100004196167
 
         preprocess:
             blind: 0.2
 
         mapping:
-            noiseless_imu: true
-            acc_cov: 0.001
-            gyr_cov: 0.000001
-            laser_point_cov_xy: 0.0001
+            noiseless_imu: false
+            acc_cov: 2.886601e-4
+            gyr_cov: 1.4641e-6
+            b_acc_cov: 4.0e-8
+            b_gyr_cov: 4.0e-10
+            laser_point_cov_xy: 0.2
             laser_point_cov_z: 0.2
             fov_degree:    90.0
             det_range:     15.0
@@ -54,7 +58,12 @@
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
             pressure_timeout: 0.25
             pressure_cov: 4.0652529e4
+            # Startup auto-zero removes the simulated constant offset, so do
+            # not let sonar/depth disagreement drift into pressure bias.
+            bias_init_cov: 1.0e-6
             innovation_gate_sigma: 0.0
+            fluid_density: 1028.0
+            gravity: 9.80665
 
         magnetometer:
             enable: true

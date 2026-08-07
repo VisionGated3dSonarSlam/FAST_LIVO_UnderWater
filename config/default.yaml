@@ -10,7 +10,7 @@
         map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/sonar_point_cloud"
+            lid_topic:  "/sonar_point_clou"
             imu_topic:  "/auv/imu/data_raw"
             world_frame: "World"
             world_to_camera_init_T: [ 0.0, 0.0, 0.0 ]
@@ -18,6 +18,8 @@
                                       0.0, 1.0, 0.0,
                                       0.0, 0.0, 1.0 ]
 
+            imu_rate_hz: 150.0
+            lidar_timeout: 0.25
             gravity_m_s2: 9.8100004196167
 
         preprocess:
@@ -54,7 +56,10 @@
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
             pressure_timeout: 0.25
             pressure_cov: 4.0652529e4
+            bias_init_cov: 1.0e-6
             innovation_gate_sigma: 0.0
+            fluid_density: 1028.0
+            gravity: 9.80665
 
         magnetometer:
             enable: true

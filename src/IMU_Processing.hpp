@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <math.h>
 #include <deque>
@@ -11,6 +12,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <condition_variable>
+#include <functional>
 #include <nav_msgs/msg/odometry.hpp>
 #include <pcl/common/transforms.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -31,6 +33,8 @@ class ImuProcess
 {
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  using Ekf = esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom>;
+  using TimedUpdateCallback = std::function<bool(std::size_t, Ekf &)>;
 
   ImuProcess();
   ~ImuProcess();
@@ -55,18 +59,10 @@ class ImuProcess
   bool IsInitialized() const;
   Eigen::Matrix<double, process_noise_ikfom::DOF, process_noise_ikfom::DOF> Q;
   void Process(const MeasureGroup &meas,
-               esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-               PointCloudXYZI::Ptr pcl_un_);
-
-  // Forward-propagate the EKF from last_lidar_end_time_ to target_time, using
-  // IMU samples from imu_msgs whose stamp is within that window. Final
-  // sub-step (covering the remainder up to target_time) reuses the most recent
-  // IMU pair's averaged input. Updates last_lidar_end_time_ to target_time.
-  // Pre-init or non-positive dt: no-op, returns true. Returns false only on
-  // missing IMU data when one is genuinely needed.
-  bool PartialPropagate(double target_time,
-                        esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-                        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs);
+               Ekf &kf_state,
+               PointCloudXYZI::Ptr pcl_un_,
+               const std::vector<double> &update_times = {},
+               const TimedUpdateCallback &timed_update = {});
 
   V3D cov_acc;
   V3D cov_gyr;
@@ -83,11 +79,21 @@ class ImuProcess
 
  private:
   void IMU_init(const MeasureGroup &meas,
-                esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+                Ekf &kf_state,
                 int &N);
   void UndistortPcl(const MeasureGroup &meas,
-                    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-                    PointCloudXYZI &pcl_in_out);
+                    Ekf &kf_state,
+                    PointCloudXYZI &pcl_in_out,
+                    const std::vector<double> &update_times,
+                    const TimedUpdateCallback &timed_update);
+  void UndistortPclFastLio(const MeasureGroup &meas,
+                           Ekf &kf_state,
+                           PointCloudXYZI &pcl_in_out);
+  bool ReconstructContinuousDeskewPoses(
+      const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
+      double scan_begin_time,
+      double scan_end_time,
+      const state_ikfom &scan_end_state);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   // sensor_msgs::ImuConstPtr last_imu_;
@@ -280,10 +286,164 @@ void ImuProcess::IMU_init(
 
 }
 
+bool ImuProcess::ReconstructContinuousDeskewPoses(
+    const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
+    double scan_begin_time,
+    double scan_end_time,
+    const state_ikfom &scan_end_state)
+{
+  struct ImuSegment
+  {
+    double begin = 0.0;
+    double end = 0.0;
+    V3D gyro = V3D::Zero();
+    V3D acc = V3D::Zero();
+  };
+
+  if (imu_msgs.size() < 2 || scan_end_time <= scan_begin_time)
+  {
+    return false;
+  }
+
+  std::vector<ImuSegment> segments;
+  double covered_time = scan_begin_time;
+  V3D previous_gyro = V3D::Zero();
+  V3D previous_acc = V3D::Zero();
+  bool have_previous_input = false;
+  constexpr double time_epsilon = 1e-9;
+
+  auto append_segment = [&](double begin, double end,
+                            const V3D &gyro, const V3D &acc)
+  {
+    if (end <= begin + time_epsilon)
+    {
+      return;
+    }
+    segments.push_back({begin, end, gyro, acc});
+    covered_time = end;
+  };
+
+  for (auto it = imu_msgs.begin(); it < imu_msgs.end() - 1; ++it)
+  {
+    const auto &head = *it;
+    const auto &tail = *(it + 1);
+    const double head_time = rclcpp::Time(head->header.stamp).seconds();
+    const double tail_time = rclcpp::Time(tail->header.stamp).seconds();
+    if (tail_time <= head_time + time_epsilon)
+    {
+      continue;
+    }
+
+    V3D gyro;
+    gyro << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+            0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+            0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+    V3D acc;
+    acc << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+           0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+           0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+    acc *= gravity_m_s2_ / mean_acc.norm();
+
+    previous_gyro = gyro;
+    previous_acc = acc;
+    have_previous_input = true;
+
+    if (tail_time <= scan_begin_time + time_epsilon)
+    {
+      continue;
+    }
+    if (head_time >= scan_end_time - time_epsilon)
+    {
+      break;
+    }
+
+    const double segment_begin = std::max(scan_begin_time, head_time);
+    const double segment_end = std::min(scan_end_time, tail_time);
+    if (segment_begin > covered_time + time_epsilon)
+    {
+      append_segment(covered_time, segment_begin, gyro, acc);
+    }
+    append_segment(std::max(covered_time, segment_begin), segment_end, gyro, acc);
+    if (covered_time >= scan_end_time - time_epsilon)
+    {
+      break;
+    }
+  }
+
+  if (have_previous_input && covered_time < scan_end_time - time_epsilon)
+  {
+    append_segment(covered_time, scan_end_time, previous_gyro, previous_acc);
+  }
+  if (segments.empty() ||
+      segments.front().begin > scan_begin_time + time_epsilon ||
+      segments.back().end < scan_end_time - time_epsilon)
+  {
+    return false;
+  }
+
+  struct KinematicState
+  {
+    M3D rotation = M3D::Identity();
+    V3D velocity = V3D::Zero();
+    V3D position = V3D::Zero();
+  };
+
+  std::vector<KinematicState> states(segments.size() + 1);
+  std::vector<V3D> segment_acc_world(segments.size(), V3D::Zero());
+  std::vector<V3D> segment_gyro_body(segments.size(), V3D::Zero());
+  states.back().rotation = scan_end_state.rot.toRotationMatrix();
+  states.back().velocity = scan_end_state.vel;
+  states.back().position = scan_end_state.pos;
+  const V3D gravity(scan_end_state.grav[0],
+                    scan_end_state.grav[1],
+                    scan_end_state.grav[2]);
+  const V3D gyro_bias(scan_end_state.bg[0],
+                      scan_end_state.bg[1],
+                      scan_end_state.bg[2]);
+  const V3D acc_bias(scan_end_state.ba[0],
+                     scan_end_state.ba[1],
+                     scan_end_state.ba[2]);
+
+  for (std::size_t reverse_index = segments.size(); reverse_index > 0; --reverse_index)
+  {
+    const std::size_t i = reverse_index - 1;
+    const double dt = segments[i].end - segments[i].begin;
+    const V3D omega = segments[i].gyro - gyro_bias;
+    const V3D specific_force = segments[i].acc - acc_bias;
+    states[i].rotation = states[i + 1].rotation * Exp(omega, -dt);
+    const V3D acc_begin = states[i].rotation * specific_force + gravity;
+    const V3D acc_end = states[i + 1].rotation * specific_force + gravity;
+    const V3D acc_world = 0.5 * (acc_begin + acc_end);
+    states[i].velocity = states[i + 1].velocity - acc_world * dt;
+    states[i].position = states[i + 1].position -
+                         states[i + 1].velocity * dt +
+                         0.5 * acc_world * dt * dt;
+    segment_acc_world[i] = acc_world;
+    segment_gyro_body[i] = omega;
+  }
+
+  IMUpose.clear();
+  IMUpose.reserve(states.size());
+  IMUpose.push_back(set_pose6d(
+      0.0, segment_acc_world.front(), segment_gyro_body.front(),
+      states.front().velocity, states.front().position, states.front().rotation));
+  for (std::size_t i = 0; i < segments.size(); ++i)
+  {
+    IMUpose.push_back(set_pose6d(
+        segments[i].end - scan_begin_time,
+        segment_acc_world[i], segment_gyro_body[i],
+        states[i + 1].velocity, states[i + 1].position,
+        states[i + 1].rotation));
+  }
+  return true;
+}
+
 void ImuProcess::UndistortPcl(
     const MeasureGroup &meas,
-    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-    PointCloudXYZI &pcl_out)
+    Ekf &kf_state,
+    PointCloudXYZI &pcl_out,
+    const std::vector<double> &update_times,
+    const TimedUpdateCallback &timed_update)
 {
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
@@ -302,13 +462,72 @@ void ImuProcess::UndistortPcl(
   IMUpose.clear();
   IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
 
-  /*** forward propagation at each imu point ***/
+  /*** forward propagation at each IMU point and auxiliary timestamp ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
   M3D R_imu;
-
-  double dt = 0;
-
   input_ikfom in;
+  bool have_input = false;
+  bool auxiliary_state_updated = false;
+  std::size_t update_index = 0;
+
+  auto record_pose = [&](double timestamp)
+  {
+    imu_state = kf_state.get_x();
+    angvel_last = angvel_avr - imu_state.bg;
+    acc_s_last = imu_state.rot * (acc_avr - imu_state.ba);
+    for (int i = 0; i < 3; ++i) acc_s_last[i] += imu_state.grav[i];
+    const double offset_time = timestamp - pcl_beg_time;
+    IMUpose.push_back(set_pose6d(offset_time, acc_s_last, angvel_last,
+                                imu_state.vel, imu_state.pos,
+                                imu_state.rot.toRotationMatrix()));
+  };
+
+  // Advance one constant-IMU-input segment, splitting it only where an
+  // asynchronous measurement belongs. With no events this performs the same
+  // single predict call as the original FAST-LIO2 propagation.
+  auto propagate_segment = [&](double segment_start, double segment_end,
+                               bool record_segment_end)
+  {
+    double current_time = segment_start;
+    constexpr double time_epsilon = 1e-9;
+    while (update_index < update_times.size() &&
+           update_times[update_index] <= segment_end + time_epsilon)
+    {
+      const double event_time =
+          std::clamp(update_times[update_index], current_time, segment_end);
+      double dt = event_time - current_time;
+      if (dt > 0.0) kf_state.predict(dt, Q, in);
+      current_time = event_time;
+
+      const double grouped_timestamp = update_times[update_index];
+      do
+      {
+        if (timed_update)
+        {
+          auxiliary_state_updated =
+              timed_update(update_index, kf_state) || auxiliary_state_updated;
+        }
+        ++update_index;
+      }
+      while (update_index < update_times.size() &&
+             update_times[update_index] <= grouped_timestamp + time_epsilon &&
+             update_times[update_index] <= segment_end + time_epsilon);
+
+      if (current_time >= pcl_beg_time - time_epsilon &&
+          current_time < segment_end - time_epsilon)
+      {
+        record_pose(current_time);
+      }
+    }
+
+    double remaining_dt = segment_end - current_time;
+    if (std::abs(remaining_dt) > time_epsilon)
+    {
+      kf_state.predict(remaining_dt, Q, in);
+    }
+    if (record_segment_end) record_pose(segment_end);
+  };
+
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -318,7 +537,7 @@ void ImuProcess::UndistortPcl(
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
     if (tail_stamp < last_lidar_end_time_)    continue;
-    
+
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
                 0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
@@ -329,42 +548,40 @@ void ImuProcess::UndistortPcl(
 
     acc_avr     = acc_avr * gravity_m_s2_ / mean_acc.norm(); // - state_inout.ba;
 
-    if(head_stamp < last_lidar_end_time_)
-    {
-      dt = tail_stamp - last_lidar_end_time_;
-      // dt = tail->header.stamp.toSec() - pcl_beg_time;
-    }
-    else
-    {
-      dt = tail_stamp - head_stamp;
-    }
-    
     in.acc = acc_avr;
     in.gyro = angvel_avr;
+    have_input = true;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
 
-    /* save the poses at each IMU measurements */
-    imu_state = kf_state.get_x();
-    angvel_last = angvel_avr - imu_state.bg;
-    acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
-    for(int i=0; i<3; i++)
-    {
-      acc_s_last[i] += imu_state.grav[i];
-    }
-    double &&offs_t = tail_stamp - pcl_beg_time;
-    IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+    const double segment_start =
+        head_stamp < last_lidar_end_time_ ? last_lidar_end_time_ : head_stamp;
+    propagate_segment(segment_start, tail_stamp, true);
   }
 
   /*** calculated the pos and attitude prediction at the frame-end ***/
-  double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
-  dt = note * (pcl_end_time - imu_end_time);
-  kf_state.predict(dt, Q, in);
+  if (have_input)
+  {
+    if (pcl_end_time >= imu_end_time)
+    {
+      propagate_segment(imu_end_time, pcl_end_time, false);
+    }
+    else
+    {
+      // Preserve FAST-LIO2's original positive frame-end extrapolation.
+      double final_dt = imu_end_time - pcl_end_time;
+      kf_state.predict(final_dt, Q, in);
+    }
+  }
 
   imu_state = kf_state.get_x();
+  if (auxiliary_state_updated)
+  {
+    ReconstructContinuousDeskewPoses(
+        v_imu, pcl_beg_time, pcl_end_time, imu_state);
+  }
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
@@ -383,7 +600,7 @@ void ImuProcess::UndistortPcl(
 
     for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
     {
-      dt = it_pcl->curvature / double(1000) - head->offset_time;
+      const double dt = it_pcl->curvature / double(1000) - head->offset_time;
 
       /* Transform to the 'end' frame, using only the rotation
        * Note: Compensation direction is INVERSE of Frame's moving direction
@@ -405,10 +622,124 @@ void ImuProcess::UndistortPcl(
   }
 }
 
+void ImuProcess::UndistortPclFastLio(
+    const MeasureGroup &meas,
+    Ekf &kf_state,
+    PointCloudXYZI &pcl_out)
+{
+  // Keep the no-auxiliary path identical to FAST-LIO2's scan-bounded IMU
+  // propagation and backward point-cloud undistortion.
+  auto v_imu = meas.imu;
+  v_imu.push_front(last_imu_);
+  const double imu_end_time = rclcpp::Time(v_imu.back()->header.stamp).seconds();
+  const double pcl_beg_time = meas.lidar_beg_time;
+  const double pcl_end_time = meas.lidar_end_time;
+
+  pcl_out = *(meas.lidar);
+  sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
+
+  state_ikfom imu_state = kf_state.get_x();
+  IMUpose.clear();
+  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last,
+                              imu_state.vel, imu_state.pos,
+                              imu_state.rot.toRotationMatrix()));
+
+  V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
+  M3D R_imu;
+  double dt = 0.0;
+  input_ikfom in;
+  bool have_input = false;
+
+  for (auto it_imu = v_imu.begin(); it_imu < v_imu.end() - 1; ++it_imu)
+  {
+    const auto &head = *it_imu;
+    const auto &tail = *(it_imu + 1);
+    const double tail_stamp = rclcpp::Time(tail->header.stamp).seconds();
+    const double head_stamp = rclcpp::Time(head->header.stamp).seconds();
+
+    if (tail_stamp < last_lidar_end_time_) continue;
+
+    angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+                  0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+                  0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+    acc_avr << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+               0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+               0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+    acc_avr *= gravity_m_s2_ / mean_acc.norm();
+
+    dt = head_stamp < last_lidar_end_time_
+             ? tail_stamp - last_lidar_end_time_
+             : tail_stamp - head_stamp;
+    in.acc = acc_avr;
+    in.gyro = angvel_avr;
+    have_input = true;
+    Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
+    Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+    Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+    Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+    kf_state.predict(dt, Q, in);
+
+    imu_state = kf_state.get_x();
+    angvel_last = angvel_avr - imu_state.bg;
+    acc_s_last = imu_state.rot * (acc_avr - imu_state.ba);
+    for (int i = 0; i < 3; ++i) acc_s_last[i] += imu_state.grav[i];
+    const double offset_time = tail_stamp - pcl_beg_time;
+    IMUpose.push_back(set_pose6d(offset_time, acc_s_last, angvel_last,
+                                imu_state.vel, imu_state.pos,
+                                imu_state.rot.toRotationMatrix()));
+  }
+
+  if (have_input)
+  {
+    const double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
+    dt = note * (pcl_end_time - imu_end_time);
+    kf_state.predict(dt, Q, in);
+  }
+
+  imu_state = kf_state.get_x();
+  last_imu_ = meas.imu.back();
+  last_lidar_end_time_ = pcl_end_time;
+
+  if (pcl_out.points.empty()) return;
+  auto it_pcl = pcl_out.points.end() - 1;
+  for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); --it_kp)
+  {
+    const auto head = it_kp - 1;
+    const auto tail = it_kp;
+    R_imu << MAT_FROM_ARRAY(head->rot);
+    vel_imu << VEC_FROM_ARRAY(head->vel);
+    pos_imu << VEC_FROM_ARRAY(head->pos);
+    acc_imu << VEC_FROM_ARRAY(tail->acc);
+    angvel_avr << VEC_FROM_ARRAY(tail->gyr);
+
+    for (; it_pcl->curvature / 1000.0 > head->offset_time; --it_pcl)
+    {
+      dt = it_pcl->curvature / 1000.0 - head->offset_time;
+      const M3D R_i(R_imu * Exp(angvel_avr, dt));
+      const V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
+      const V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt -
+                     imu_state.pos);
+      const V3D P_compensate =
+          imu_state.offset_R_L_I.conjugate() *
+          (imu_state.rot.conjugate() *
+               (R_i * (imu_state.offset_R_L_I * P_i +
+                       imu_state.offset_T_L_I) +
+                T_ei) -
+           imu_state.offset_T_L_I);
+      it_pcl->x = P_compensate.x();
+      it_pcl->y = P_compensate.y();
+      it_pcl->z = P_compensate.z();
+      if (it_pcl == pcl_out.points.begin()) break;
+    }
+  }
+}
+
 void ImuProcess::Process(
     const MeasureGroup &meas,
-    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-    PointCloudXYZI::Ptr cur_pcl_un_)
+    Ekf &kf_state,
+    PointCloudXYZI::Ptr cur_pcl_un_,
+    const std::vector<double> &update_times,
+    const TimedUpdateCallback &timed_update)
 {
   if(meas.imu.empty()) {return;};
   assert(meas.lidar != nullptr);
@@ -419,7 +750,7 @@ void ImuProcess::Process(
     IMU_init(meas, kf_state, init_iter_num);
 
     imu_need_init_ = true;
-    
+
     last_imu_   = meas.imu.back();
 
     if (init_iter_num > MAX_INI_COUNT)
@@ -434,97 +765,12 @@ void ImuProcess::Process(
     return;
   }
 
-  UndistortPcl(meas, kf_state, *cur_pcl_un_);
-}
-
-bool ImuProcess::PartialPropagate(double target_time,
-                                  esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
-                                  const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs)
-{
-  // Skip when EKF is not ready or target is in the past relative to current state.
-  if (imu_need_init_) return true;
-  if (last_lidar_end_time_ < 0.0 && last_imu_)
+  if (update_times.empty())
   {
-    last_lidar_end_time_ = rclcpp::Time(last_imu_->header.stamp).seconds();
+    UndistortPclFastLio(meas, kf_state, *cur_pcl_un_);
   }
-  if (last_lidar_end_time_ < 0.0) return true;
-  if (target_time <= last_lidar_end_time_ + 1e-9) return true;
-
-  // Build the same head/tail walk used in UndistortPcl: prepend last_imu_ so the
-  // first pair starts from the most recently fully-consumed sample.
-  std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> v_imu = imu_msgs;
-  if (last_imu_) v_imu.push_front(last_imu_);
-  if (v_imu.size() < 2) return false;
-
-  V3D angvel_avr, acc_avr;
-  input_ikfom in;
-  bool have_input = false;
-
-  for (auto it_imu = v_imu.begin(); it_imu < v_imu.end() - 1; ++it_imu)
+  else
   {
-    if (last_lidar_end_time_ >= target_time - 1e-9) break;
-
-    const auto &head = *it_imu;
-    const auto &tail = *(it_imu + 1);
-    const double tail_stamp = rclcpp::Time(tail->header.stamp).seconds();
-    const double head_stamp = rclcpp::Time(head->header.stamp).seconds();
-
-    if (tail_stamp < last_lidar_end_time_) continue;
-    if (head_stamp >= target_time) break;
-
-    angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
-                  0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
-                  0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
-    acc_avr   << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
-                  0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
-                  0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
-    acc_avr = acc_avr * gravity_m_s2_ / mean_acc.norm();
-
-    const double seg_start = std::max(head_stamp, last_lidar_end_time_);
-    const double seg_end = std::min(tail_stamp, target_time);
-    double dt = seg_end - seg_start;
-    if (dt <= 0.0) continue;
-
-    in.acc = acc_avr;
-    in.gyro = angvel_avr;
-    have_input = true;
-    Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
-    Q.block<3, 3>(3, 3).diagonal() = cov_acc;
-    Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
-    Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
-
-    last_lidar_end_time_ = seg_end;
-    state_ikfom st = kf_state.get_x();
-    angvel_last = angvel_avr - st.bg;
-    acc_s_last = st.rot * (acc_avr - st.ba);
-    for (int i = 0; i < 3; ++i) acc_s_last[i] += st.grav[i];
+    UndistortPcl(meas, kf_state, *cur_pcl_un_, update_times, timed_update);
   }
-
-  // If target is past the last available IMU sample, extrapolate using the
-  // most recent averaged input we computed.
-  if (last_lidar_end_time_ < target_time - 1e-9 && have_input)
-  {
-    double dt = target_time - last_lidar_end_time_;
-    kf_state.predict(dt, Q, in);
-    last_lidar_end_time_ = target_time;
-    state_ikfom st = kf_state.get_x();
-    angvel_last = angvel_avr - st.bg;
-    acc_s_last = st.rot * (acc_avr - st.ba);
-    for (int i = 0; i < 3; ++i) acc_s_last[i] += st.grav[i];
-  }
-
-  for (const auto &imu : imu_msgs)
-  {
-    if (rclcpp::Time(imu->header.stamp).seconds() <= last_lidar_end_time_ + 1e-9)
-    {
-      last_imu_ = imu;
-    }
-    else
-    {
-      break;
-    }
-  }
-
-  return last_lidar_end_time_ >= target_time - 1e-9;
 }

@@ -144,21 +144,31 @@ public:
         }
     };
 
-    struct JointMeasurementSet
+    enum class MeasurementKind
     {
-        std::vector<DvlMsg::ConstSharedPtr> dvl_msgs;
-        std::vector<PressureMsg::ConstSharedPtr> pressure_msgs;
-        V3D raw_gyro = V3D::Zero();
-        M3D raw_gyro_covariance = M3D::Zero();
-        bool raw_gyro_valid = false;
-        bool raw_gyro_covariance_valid = false;
-        int dvl_count = 0;
-        int pressure_count = 0;
+        Dvl,
+        Pressure,
+        Magnetometer
+    };
 
-        int max_rows() const
+    struct TimedMeasurement
+    {
+        double timestamp = 0.0;
+        MeasurementKind kind = MeasurementKind::Dvl;
+        DvlMsg::ConstSharedPtr dvl;
+        PressureMsg::ConstSharedPtr pressure;
+        MagMsg::ConstSharedPtr magnetometer;
+    };
+
+    struct LateMeasurementCounts
+    {
+        std::size_t dvl = 0;
+        std::size_t pressure = 0;
+        std::size_t magnetometer = 0;
+
+        std::size_t total() const
         {
-            return (dvl_count > 0 ? 3 : 0) +
-                   (pressure_count > 0 ? 1 : 0);
+            return dvl + pressure + magnetometer;
         }
     };
 
@@ -182,6 +192,7 @@ public:
         node.declare_parameter<double>("dvl.innovation_gate_sigma", 5.0);
         node.declare_parameter<double>("dvl.bias_init_cov", 1e-8);
         node.declare_parameter<double>("pressure.pressure_cov", 1e4);
+        node.declare_parameter<double>("pressure.bias_init_cov", 1e4);
         node.declare_parameter<double>("pressure.innovation_gate_sigma", 0.0);
         node.declare_parameter<double>("pressure.fluid_density", 1025.0);
         node.declare_parameter<double>("pressure.gravity", 9.80665);
@@ -215,6 +226,7 @@ public:
         node.get_parameter_or<std::string>("pressure.topic", pressure_topic_, "/auv/pressure/scaled2");
         node.get_parameter_or<double>("pressure.pressure_timeout", pressure_timeout_, 0.25);
         node.get_parameter_or<double>("pressure.pressure_cov", pressure_cov_, 1e4);
+        node.get_parameter_or<double>("pressure.bias_init_cov", pressure_b_init_cov_, 1e4);
         node.get_parameter_or<double>("pressure.innovation_gate_sigma", pressure_innovation_gate_sigma_, 0.0);
         node.get_parameter_or<double>("pressure.fluid_density", pressure_fluid_density_, 1025.0);
         node.get_parameter_or<double>("pressure.gravity", pressure_gravity_, 9.80665);
@@ -314,6 +326,7 @@ public:
         dvl_innovation_gate_sigma_ = std::max(0.0, dvl_innovation_gate_sigma_);
         dvl_b_init_cov_ = std::max(1e-12, dvl_b_init_cov_);
         pressure_cov_ = std::max(1e-6, pressure_cov_);
+        pressure_b_init_cov_ = std::max(1e-12, pressure_b_init_cov_);
         pressure_innovation_gate_sigma_ = std::max(0.0, pressure_innovation_gate_sigma_);
         pressure_fluid_density_ = std::max(1e-6, pressure_fluid_density_);
         pressure_gravity_ = std::max(1e-6, pressure_gravity_);
@@ -353,288 +366,69 @@ public:
         }
     }
 
-    JointMeasurementSet take_joint_measurements(
-        double begin_time,
-        double end_time,
-        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs)
+    std::vector<TimedMeasurement> take_timed_measurements(double begin_time,
+                                                          double end_time)
     {
-        JointMeasurementSet joint;
+        std::vector<TimedMeasurement> measurements;
         if (dvl_enable_)
         {
-            joint.dvl_msgs = take_dvl_measurements(begin_time, end_time);
-            joint.dvl_count = static_cast<int>(joint.dvl_msgs.size());
-            if (!joint.dvl_msgs.empty())
+            const auto messages = take_dvl_measurements(begin_time, end_time);
+            measurements.reserve(measurements.size() + messages.size());
+            for (const auto &msg : messages)
             {
-                const double dvl_time = get_time_sec(joint.dvl_msgs.back()->header.stamp);
-                const ImuAngularSample imu_sample =
-                    imu_angular_sample_at_time(dvl_time, imu_msgs);
-                joint.raw_gyro = imu_sample.raw_gyro;
-                joint.raw_gyro_covariance = imu_sample.covariance;
-                joint.raw_gyro_valid = imu_sample.valid;
-                joint.raw_gyro_covariance_valid = imu_sample.covariance_valid;
+                measurements.push_back(
+                    {get_time_sec(msg->header.stamp), MeasurementKind::Dvl, msg, nullptr, nullptr});
             }
         }
         if (pressure_enable_)
         {
-            joint.pressure_msgs = take_pressure_measurements(begin_time, end_time);
-            joint.pressure_count = static_cast<int>(joint.pressure_msgs.size());
-        }
-        return joint;
-    }
-
-    UpdateSummary summarize_joint_measurements(const JointMeasurementSet &joint,
-                                               const state_ikfom &state,
-                                               const typename Ekf::cov &P) const
-    {
-        UpdateSummary summary;
-        summary.dvl_count = joint.dvl_count;
-        summary.pressure_count = joint.pressure_count;
-        summary.pressure_accepted = joint.pressure_count > 0 ? 1 : 0;
-        summary.pressure_rejected = summary.pressure_count - summary.pressure_accepted;
-        summary.pressure_updated = !joint.pressure_msgs.empty();
-
-        if (!joint.dvl_msgs.empty())
-        {
-            const DvlLinearization dvl = build_joint_dvl_linearization(joint, state);
-            if (dvl.valid)
-            {
-                summary.dvl_res_norm_sum = dvl.residual.norm();
-                summary.dvl_res_norm_max = dvl.residual.norm();
-                summary.dvl_res_sum = dvl.residual;
-                summary.dvl_res_abs_max = dvl.residual.cwiseAbs();
-                summary.dvl_meas_sum = dvl.measurement;
-                summary.dvl_pred_sum = dvl.prediction;
-                summary.dvl_body_vel_sum = dvl.dvl_origin_velocity_vehicle;
-            }
-            const bool accepted = dvl.valid && dvl_passes_gate(dvl, P);
-            summary.dvl_accepted = accepted ? 1 : 0;
-            summary.dvl_rejected = summary.dvl_count - summary.dvl_accepted;
-            summary.dvl_updated = accepted;
-        }
-        if (!joint.pressure_msgs.empty())
-        {
-            double pressure_sum = 0.0;
-            for (const auto &msg : joint.pressure_msgs)
-            {
-                pressure_sum += msg->fluid_pressure;
-            }
-            const double mean_pressure = pressure_sum / static_cast<double>(joint.pressure_msgs.size());
-            const double residual_depth = (mean_pressure - pressure_prediction(state)) / pressure_scale();
-            summary.pressure_res_depth_sum = std::abs(residual_depth);
-            summary.pressure_res_depth_max = std::abs(residual_depth);
-        }
-        return summary;
-    }
-
-    int append_joint_measurement_rows(const JointMeasurementSet &joint,
-                                      const state_ikfom &state,
-                                      const typename Ekf::cov &P,
-                                      Eigen::MatrixXd &H,
-                                      Eigen::VectorXd &h,
-                                      int row)
-    {
-        if (!joint.dvl_msgs.empty())
-        {
-            const DvlLinearization dvl = build_joint_dvl_linearization(joint, state);
-            if (dvl.valid && dvl_passes_gate(dvl, P))
-            {
-                Eigen::LLT<M3D> llt(dvl.R);
-                const M3D L = llt.matrixL();
-                const M3D H_whitener =
-                    L.template triangularView<Eigen::Lower>().solve(M3D::Identity());
-                H.block(row, 0, 3, state_ikfom::DOF) = H_whitener * dvl.H;
-                h.segment(row, 3) = H_whitener * dvl.residual;
-                row += 3;
-            }
-        }
-
-        if (!joint.pressure_msgs.empty() && finalize_pressure_reference_if_needed(state))
-        {
-            double pressure_sum = 0.0;
-            double cov_sum = 0.0;
-            for (const auto &msg : joint.pressure_msgs)
-            {
-                pressure_sum += msg->fluid_pressure;
-                cov_sum += covariance_or_fallback(msg->variance, pressure_cov_);
-            }
-            const double mean_pressure = pressure_sum / static_cast<double>(joint.pressure_msgs.size());
-            const double residual = mean_pressure - pressure_prediction(state);
-            const double cov = cov_sum / static_cast<double>(joint.pressure_msgs.size());
-            if (pressure_innovation_gate_sigma_ <= 0.0 ||
-                std::abs(residual) <= pressure_innovation_gate_sigma_ * std::sqrt(cov))
-            {
-                Eigen::MatrixXd H_pressure = Eigen::MatrixXd::Zero(1, state_ikfom::DOF);
-                // Pressure measures World-z depth, but it must not correct
-                // horizontal x/y. Use the World-z prediction and let the EKF
-                // correct only local depth.
-                H_pressure(0, 2) = -pressure_scale() * world_z_axis_in_camera_init().z();
-                H_pressure(0, 26) = 1.0;
-                const double inv_sigma = 1.0 / std::sqrt(cov);
-                H.row(row) = H_pressure.row(0) * inv_sigma;
-                h(row) = residual * inv_sigma;
-                ++row;
-            }
-        }
-
-        return row;
-    }
-
-    // Time-ordered event fusion for no-scan operation: walks all auxiliary
-    // measurements in [begin_time, end_time] in chronological order. Magnetic
-    // samples still use the same separate constrained scalar update as scan mode.
-    // The propagator advances the EKF before each event so the residual is
-    // evaluated at the measurement's own timestamp. This avoids the previous
-    // scan-epoch-batched fusion where every aux measurement was evaluated at
-    // the trailing sonar/state time, producing wrong velocity residuals
-    // proportional to (state_time - measurement_time).
-    template <typename PropagatorFn>
-    UpdateSummary process_interval_interleaved(double begin_time,
-                                               double end_time,
-                                               const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
-                                               Ekf &kf,
-                                               PropagatorFn &&propagate_to)
-    {
-        UpdateSummary summary;
-
-        std::vector<DvlMsg::ConstSharedPtr> dvl_msgs;
-        std::vector<PressureMsg::ConstSharedPtr> pres_msgs;
-        std::vector<MagMsg::ConstSharedPtr> mag_msgs;
-        if (dvl_enable_)      dvl_msgs  = take_dvl_measurements(begin_time, end_time);
-        if (pressure_enable_) pres_msgs = take_pressure_measurements(begin_time, end_time);
-        if (mag_enable_)      mag_msgs  = take_mag_measurements(begin_time, end_time);
-
-        // Pressure: apply ALL messages in [begin_time, end_time], each at its
-        // own timestamp. Matches Codex's original timestamp-ordered fusion
-        // (which the user wants restored). The earlier "messages.back() only"
-        // logic in process_interval was a workaround for the wrong-time bug.
-
-        enum Kind { K_DVL, K_PRES, K_MAG };
-        struct Event {
-            double t;
-            Kind kind;
-            std::size_t idx;
-            bool allow_mag_update = true;
-        };
-        std::vector<Event> events;
-        events.reserve(dvl_msgs.size() + pres_msgs.size() + mag_msgs.size());
-        for (std::size_t i = 0; i < dvl_msgs.size(); ++i)
-            events.push_back({get_time_sec(dvl_msgs[i]->header.stamp), K_DVL, i, true});
-        for (std::size_t i = 0; i < pres_msgs.size(); ++i)
-            events.push_back({get_time_sec(pres_msgs[i]->header.stamp), K_PRES, i, true});
-        if (!mag_msgs.empty() && !mag_reference_is_ready())
-        {
-            // Consume the buffered high-rate samples immediately so the local
-            // heading reference is ready before stand-alone DVL can affect
-            // attitude. Only the newest sample may perform a state update.
-            for (std::size_t i = 0; i < mag_msgs.size(); ++i)
-            {
-                events.push_back({get_time_sec(mag_msgs[i]->header.stamp), K_MAG, i,
-                                  i + 1 == mag_msgs.size()});
-            }
-        }
-        else if (!mag_msgs.empty())
-        {
-            const std::size_t i = mag_msgs.size() - 1;
-            events.push_back({get_time_sec(mag_msgs[i]->header.stamp), K_MAG, i, true});
-        }
-        std::stable_sort(events.begin(), events.end(),
-                         [](const Event &a, const Event &b) { return a.t < b.t; });
-
-        for (const auto &ev : events)
-        {
-            // Advance EKF state to the measurement's own timestamp.
-            if (!propagate_to(ev.t))
-            {
-                continue;
-            }
-
-            // Use the raw IMU angular rate closest to the auxiliary timestamp.
-            // The model removes the current gyro-bias estimate for lever-arm
-            // compensation, while DVL directly observes velocity and DVL bias.
-            const ImuAngularSample imu_sample = imu_angular_sample_at_time(ev.t, imu_msgs);
-
-            switch (ev.kind)
-            {
-                case K_DVL:
-                {
-                    const auto &msg = *dvl_msgs[ev.idx];
-                    const state_ikfom state = kf.get_x();
-                    const DvlLinearization dvl =
-                        build_dvl_linearization(make_dvl_observation(msg, imu_sample, state), state);
-                    summary.dvl_count++;
-                    if (dvl.valid)
-                    {
-                        summary.dvl_res_norm_sum += dvl.residual.norm();
-                        summary.dvl_res_norm_max =
-                            std::max(summary.dvl_res_norm_max, dvl.residual.norm());
-                        summary.dvl_res_sum += dvl.residual;
-                        summary.dvl_res_abs_max =
-                            summary.dvl_res_abs_max.cwiseMax(dvl.residual.cwiseAbs());
-                        summary.dvl_meas_sum += dvl.measurement;
-                        summary.dvl_pred_sum += dvl.prediction;
-                        summary.dvl_body_vel_sum += dvl.dvl_origin_velocity_vehicle;
-                    }
-                    const bool accepted = apply_dvl_update(msg, imu_sample, kf);
-                    summary.dvl_accepted += accepted ? 1 : 0;
-                    summary.dvl_rejected += accepted ? 0 : 1;
-                    summary.dvl_updated = accepted || summary.dvl_updated;
-                    break;
-                }
-                case K_PRES:
-                {
-                    const auto &msg = *pres_msgs[ev.idx];
-                    const double residual_pa = pressure_residual(msg, kf.get_x());
-                    const double residual_depth = residual_pa / pressure_scale();
-                    summary.pressure_count++;
-                    summary.pressure_res_depth_sum += std::abs(residual_depth);
-                    summary.pressure_res_depth_max = std::max(summary.pressure_res_depth_max,
-                                                              std::abs(residual_depth));
-                    const bool accepted = apply_pressure_update(msg, kf);
-                    summary.pressure_accepted += accepted ? 1 : 0;
-                    summary.pressure_rejected += accepted ? 0 : 1;
-                    summary.pressure_updated = accepted || summary.pressure_updated;
-                    break;
-                }
-                case K_MAG:
-                {
-                    const auto &msg = *mag_msgs[ev.idx];
-                    double residual = 0.0;
-                    const bool accepted = apply_mag_update(
-                        msg, kf, &residual, ev.allow_mag_update);
-                    if (ev.allow_mag_update)
-                    {
-                        summary.mag_count++;
-                        summary.mag_res_norm_sum += std::abs(residual);
-                        summary.mag_res_norm_max =
-                            std::max(summary.mag_res_norm_max, std::abs(residual));
-                        summary.mag_accepted += accepted ? 1 : 0;
-                        summary.mag_rejected += accepted ? 0 : 1;
-                        summary.mag_updated = accepted || summary.mag_updated;
-                    }
-                    break;
-                }
-            }
-        }
-
-        return summary;
-    }
-
-    UpdateSummary process_interval(double begin_time,
-                                   double end_time,
-                                   const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
-                                   Ekf &kf)
-    {
-        UpdateSummary summary;
-        const ImuAngularSample imu_sample = latest_imu_angular_sample(imu_msgs);
-
-        auto process_dvl = [&]()
-        {
-            const auto messages = take_dvl_measurements(begin_time, end_time);
+            const auto messages = take_pressure_measurements(begin_time, end_time);
+            measurements.reserve(measurements.size() + messages.size());
             for (const auto &msg : messages)
             {
+                measurements.push_back(
+                    {get_time_sec(msg->header.stamp), MeasurementKind::Pressure, nullptr, msg, nullptr});
+            }
+        }
+        if (mag_enable_)
+        {
+            const auto messages = take_mag_measurements(begin_time, end_time);
+            measurements.reserve(measurements.size() + messages.size());
+            for (const auto &msg : messages)
+            {
+                measurements.push_back(
+                    {get_time_sec(msg->header.stamp), MeasurementKind::Magnetometer, nullptr, nullptr, msg});
+            }
+        }
+
+        std::stable_sort(measurements.begin(), measurements.end(),
+                         [](const TimedMeasurement &a, const TimedMeasurement &b) {
+                             return a.timestamp < b.timestamp;
+                         });
+        return measurements;
+    }
+
+    bool apply_timed_measurement(
+        const TimedMeasurement &measurement,
+        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
+        Ekf &kf,
+        UpdateSummary &summary)
+    {
+        const ImuAngularSample imu_sample =
+            imu_angular_sample_at_time(measurement.timestamp, imu_msgs);
+
+        switch (measurement.kind)
+        {
+            case MeasurementKind::Dvl:
+            {
+                if (!measurement.dvl)
+                {
+                    return false;
+                }
+                const auto &msg = *measurement.dvl;
                 const state_ikfom state = kf.get_x();
                 const DvlLinearization dvl =
-                    build_dvl_linearization(make_dvl_observation(*msg, imu_sample, state), state);
+                    build_dvl_linearization(make_dvl_observation(msg, imu_sample, state), state);
                 summary.dvl_count++;
                 if (dvl.valid)
                 {
@@ -648,71 +442,59 @@ public:
                     summary.dvl_pred_sum += dvl.prediction;
                     summary.dvl_body_vel_sum += dvl.dvl_origin_velocity_vehicle;
                 }
-                const bool accepted = apply_dvl_update(*msg, imu_sample, kf);
+                const bool accepted = apply_dvl_update(msg, imu_sample, kf);
                 summary.dvl_accepted += accepted ? 1 : 0;
                 summary.dvl_rejected += accepted ? 0 : 1;
                 summary.dvl_updated = accepted || summary.dvl_updated;
+                return accepted;
             }
-        };
-
-        auto process_pressure = [&]()
-        {
-            const auto messages = take_pressure_measurements(begin_time, end_time);
-            if (!messages.empty())
+            case MeasurementKind::Pressure:
             {
-                const auto &msg = messages.back();
-                const double residual_pa = pressure_residual(*msg, kf.get_x());
+                if (!measurement.pressure)
+                {
+                    return false;
+                }
+                const auto &msg = *measurement.pressure;
+                const double residual_pa = pressure_residual(msg, kf.get_x());
                 const double residual_depth = residual_pa / pressure_scale();
-                summary.pressure_count = 1;
-                summary.pressure_res_depth_sum = std::abs(residual_depth);
-                summary.pressure_res_depth_max = std::abs(residual_depth);
-                summary.pressure_updated = apply_pressure_update(*msg, kf);
-                summary.pressure_accepted = summary.pressure_updated ? 1 : 0;
-                summary.pressure_rejected = summary.pressure_updated ? 0 : 1;
+                summary.pressure_count++;
+                summary.pressure_res_depth_sum += std::abs(residual_depth);
+                summary.pressure_res_depth_max = std::max(summary.pressure_res_depth_max,
+                                                          std::abs(residual_depth));
+                const bool accepted = apply_pressure_update(msg, kf);
+                summary.pressure_accepted += accepted ? 1 : 0;
+                summary.pressure_rejected += accepted ? 0 : 1;
+                summary.pressure_updated = accepted || summary.pressure_updated;
+                return accepted;
             }
-        };
-
-        if (dvl_enable_) process_dvl();
-        if (pressure_enable_) process_pressure();
-
-        return summary;
+            case MeasurementKind::Magnetometer:
+            {
+                if (!measurement.magnetometer)
+                {
+                    return false;
+                }
+                const auto &msg = *measurement.magnetometer;
+                double residual = 0.0;
+                const bool accepted = apply_mag_update(msg, kf, &residual);
+                summary.mag_count++;
+                summary.mag_res_norm_sum += std::abs(residual);
+                summary.mag_res_norm_max =
+                    std::max(summary.mag_res_norm_max, std::abs(residual));
+                summary.mag_accepted += accepted ? 1 : 0;
+                summary.mag_rejected += accepted ? 0 : 1;
+                summary.mag_updated = accepted || summary.mag_updated;
+                return accepted;
+            }
+        }
+        return false;
     }
 
-    // At a scan epoch use only the newest magnetic sample in the interval. All
-    // older samples are consumed, so no sample can be fused twice and the
-    // selected timestamp remains close to the corrected scan-end state.
-    UpdateSummary process_magnetometer_interval(double begin_time,
-                                                double end_time,
-                                                Ekf &kf)
+    LateMeasurementCounts take_late_measurement_counts()
     {
-        UpdateSummary summary;
-        if (!mag_enable_)
-        {
-            return summary;
-        }
-        const auto messages = take_mag_measurements(begin_time, end_time);
-        if (messages.empty())
-        {
-            return summary;
-        }
-
-        if (!mag_reference_is_ready())
-        {
-            for (std::size_t i = 0; i + 1 < messages.size(); ++i)
-            {
-                apply_mag_update(*messages[i], kf, nullptr, false);
-            }
-        }
-
-        summary.mag_count = 1;
-        double residual = 0.0;
-        const bool accepted = apply_mag_update(*messages.back(), kf, &residual);
-        summary.mag_res_norm_sum = std::abs(residual);
-        summary.mag_res_norm_max = std::abs(residual);
-        summary.mag_accepted = accepted ? 1 : 0;
-        summary.mag_rejected = accepted ? 0 : 1;
-        summary.mag_updated = accepted;
-        return summary;
+        std::lock_guard<std::mutex> lock(mutex_);
+        const LateMeasurementCounts counts = late_measurement_counts_;
+        late_measurement_counts_ = {};
+        return counts;
     }
 
     void warn_timeouts(rclcpp::Node &node, double end_time) const
@@ -752,6 +534,7 @@ public:
     double dvl_velocity_cov() const { return dvl_velocity_cov_; }
     double dvl_innovation_gate_sigma() const { return dvl_innovation_gate_sigma_; }
     double dvl_b_init_cov() const { return dvl_b_init_cov_; }
+    double pressure_b_init_cov() const { return pressure_b_init_cov_; }
 
     // Pressure measures depth along the world vertical axis, while the FAST-LIO
     // state is expressed in camera_init. Store the static camera_init pose so the
@@ -760,6 +543,20 @@ public:
     {
         camera_init_T_in_world_ = t;
         camera_init_R_in_world_ = R;
+    }
+
+    void initialize_pressure_reference_pose(const state_ikfom &state)
+    {
+        if (!pressure_enable_)
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!pressure_reference_pose_ready_)
+        {
+            pressure_reference_sensor_z_world_ = pressure_sensor_z_world(state);
+            pressure_reference_pose_ready_ = true;
+        }
     }
 
 private:
@@ -845,16 +642,6 @@ private:
             sample.covariance_valid = true;
         }
         return sample;
-    }
-
-    ImuAngularSample latest_imu_angular_sample(
-        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs) const
-    {
-        if (imu_msgs.empty())
-        {
-            return ImuAngularSample{};
-        }
-        return imu_angular_sample(*imu_msgs.back());
     }
 
     // Pick the raw IMU sample whose stamp is closest to the DVL timestamp.
@@ -960,30 +747,6 @@ private:
         return result;
     }
 
-    DvlLinearization build_joint_dvl_linearization(const JointMeasurementSet &joint,
-                                                   const state_ikfom &state) const
-    {
-        DvlObservation observation;
-        if (joint.dvl_msgs.empty())
-        {
-            return DvlLinearization{};
-        }
-
-        // The filter state is at the scan end. Use the newest DVL sample rather
-        // than averaging measurements acquired at different vehicle states.
-        const auto &msg = *joint.dvl_msgs.back();
-        observation.measurement = dvl_measurement(msg);
-        observation.covariance = dvl_measurement_covariance(msg);
-        observation.imu.raw_gyro = joint.raw_gyro;
-        observation.imu.covariance = joint.raw_gyro_covariance;
-        observation.imu.covariance_valid = joint.raw_gyro_covariance_valid;
-        observation.imu.valid = joint.raw_gyro_valid;
-        observation.valid = observation.measurement.allFinite() &&
-                            observation.covariance.allFinite() &&
-                            observation.imu.valid;
-        return build_dvl_linearization(observation, state);
-    }
-
     bool dvl_passes_gate(const DvlLinearization &dvl,
                          const typename Ekf::cov &P) const
     {
@@ -1037,7 +800,8 @@ private:
         return msg.fluid_pressure - pressure_prediction(state);
     }
 
-    bool finalize_pressure_reference_if_needed(const state_ikfom &state)
+    bool pressure_reference_ready_or_collect(const PressureMsg &msg,
+                                             const state_ikfom &state)
     {
         if (pressure_ref_finalized_)
         {
@@ -1049,6 +813,20 @@ private:
         {
             return true;
         }
+        if (!pressure_reference_pose_ready_)
+        {
+            return false;
+        }
+
+        // The state has been propagated to this pressure timestamp. Express
+        // every startup sample at the one stored reference pose before taking
+        // the mean, so vehicle motion during initialization cannot create an
+        // artificial depth offset.
+        const double relative_depth =
+            pressure_reference_sensor_z_world_ - pressure_sensor_z_world(state);
+        pressure_init_sum_ +=
+            msg.fluid_pressure - pressure_scale() * relative_depth;
+        ++pressure_init_samples_collected_;
         if (pressure_init_samples_collected_ < kPressureReferenceSamples)
         {
             return false;
@@ -1056,10 +834,11 @@ private:
 
         const double mean_pressure =
             pressure_init_sum_ / static_cast<double>(pressure_init_samples_collected_);
-        pressure_reference_sensor_z_world_ = pressure_sensor_z_world(state);
         pressure_surface_pressure_ = mean_pressure - state.b_pressure[0];
         pressure_ref_finalized_ = true;
-        return true;
+        // Reference samples calibrate the local datum and are not reused as
+        // independent Kalman measurements. Fusion starts with the next sample.
+        return false;
     }
 
     bool apply_dvl_update(const DvlMsg &msg,
@@ -1087,7 +866,7 @@ private:
     bool apply_pressure_update(const PressureMsg &msg, Ekf &kf)
     {
         const state_ikfom state = kf.get_x();
-        if (!finalize_pressure_reference_if_needed(state))
+        if (!pressure_reference_ready_or_collect(msg, state))
         {
             return false;
         }
@@ -1270,6 +1049,7 @@ private:
             const double stamp = get_time_sec(dvl_buffer_.front()->header.stamp);
             if (stamp <= begin_time + 1e-6)
             {
+                ++late_measurement_counts_.dvl;
                 dvl_buffer_.pop_front();
                 continue;
             }
@@ -1292,6 +1072,7 @@ private:
             const double stamp = get_time_sec(pressure_buffer_.front()->header.stamp);
             if (stamp <= begin_time + 1e-6)
             {
+                ++late_measurement_counts_.pressure;
                 pressure_buffer_.pop_front();
                 continue;
             }
@@ -1309,6 +1090,11 @@ private:
     {
         const double timestamp = get_time_sec(msg->header.stamp);
         std::lock_guard<std::mutex> lock(mutex_);
+        if (last_timestamp_dvl_ >= 0.0 &&
+            std::abs(timestamp - last_timestamp_dvl_) <= 1e-9)
+        {
+            return;
+        }
         if (timestamp < last_timestamp_dvl_)
         {
             dvl_buffer_.clear();
@@ -1321,19 +1107,20 @@ private:
     {
         const double timestamp = get_time_sec(msg->header.stamp);
         std::lock_guard<std::mutex> lock(mutex_);
+        if (last_timestamp_pressure_ >= 0.0 &&
+            std::abs(timestamp - last_timestamp_pressure_) <= 1e-9)
+        {
+            return;
+        }
         if (timestamp < last_timestamp_pressure_)
         {
             pressure_buffer_.clear();
             pressure_init_sum_ = 0.0;
             pressure_init_samples_collected_ = 0;
             pressure_ref_finalized_ = false;
+            pressure_reference_pose_ready_ = false;
         }
         last_timestamp_pressure_ = timestamp;
-        if (!pressure_ref_finalized_ && pressure_init_samples_collected_ < kPressureReferenceSamples)
-        {
-            pressure_init_sum_ += msg->fluid_pressure;
-            pressure_init_samples_collected_++;
-        }
         pressure_buffer_.push_back(msg);
     }
 
@@ -1341,6 +1128,11 @@ private:
     {
         const double timestamp = get_time_sec(msg->header.stamp);
         std::lock_guard<std::mutex> lock(mutex_);
+        if (last_timestamp_mag_ >= 0.0 &&
+            std::abs(timestamp - last_timestamp_mag_) <= 1e-9)
+        {
+            return;
+        }
         if (timestamp < last_timestamp_mag_)
         {
             mag_buffer_.clear();
@@ -1475,6 +1267,7 @@ private:
             const double stamp = get_time_sec(mag_buffer_.front()->header.stamp);
             if (stamp <= begin_time + 1e-6)
             {
+                ++late_measurement_counts_.magnetometer;
                 mag_buffer_.pop_front();
                 continue;
             }
@@ -1488,8 +1281,7 @@ private:
 
     bool apply_mag_update(const MagMsg &msg,
                           Ekf &kf,
-                          double *innovation_out = nullptr,
-                          bool allow_state_update = true)
+                          double *innovation_out = nullptr)
     {
         if (innovation_out)
         {
@@ -1509,11 +1301,6 @@ private:
                                 0.0, 0.0, 0.0);
             return false;
         }
-        if (!allow_state_update)
-        {
-            return false;
-        }
-
         V3D h0;
         V3D vertical_local;
         double reference_variance = 0.0;
@@ -1727,6 +1514,7 @@ private:
     double dvl_innovation_gate_sigma_ = 5.0;
     double dvl_b_init_cov_ = 1e-8;
     double pressure_cov_ = 1e4;
+    double pressure_b_init_cov_ = 1e4;
     double pressure_innovation_gate_sigma_ = 0.0;
     V3D camera_init_T_in_world_ = V3D::Zero();
     M3D camera_init_R_in_world_ = M3D::Identity();
@@ -1739,6 +1527,7 @@ private:
     double pressure_init_sum_ = 0.0;
     int pressure_init_samples_collected_ = 0;
     bool pressure_ref_finalized_ = false;
+    bool pressure_reference_pose_ready_ = false;
     double mag_cov_ = 1849.0;
     double mag_heading_cov_floor_ = 1e-6;
     double mag_innovation_gate_sigma_ = 3.0;
@@ -1765,6 +1554,7 @@ private:
     std::deque<DvlMsg::ConstSharedPtr> dvl_buffer_;
     std::deque<PressureMsg::ConstSharedPtr> pressure_buffer_;
     std::deque<MagMsg::ConstSharedPtr> mag_buffer_;
+    LateMeasurementCounts late_measurement_counts_;
     double last_timestamp_dvl_ = -1.0;
     double last_timestamp_pressure_ = -1.0;
     double last_timestamp_mag_ = -1.0;
