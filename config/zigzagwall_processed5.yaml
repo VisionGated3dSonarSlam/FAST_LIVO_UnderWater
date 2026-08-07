@@ -79,7 +79,7 @@
             pressure_timeout: 0.25
             fluid_density: 1025.0
             gravity: 9.80665
-            pressure_cov: 1.0e4
+            pressure_cov: 4.0652529e4
             innovation_gate_sigma: 0.0
             surface_z: 0.0
 

@@ -6,8 +6,8 @@
         filter_size_surf: 0.3
         # Voxel leaf size in meters for downsampling points inserted into the map/ikd-tree.
         filter_size_map: 0.3
-        cube_side_length: 60.0
-        map_file_path: "/home/attia/ros2_ws/bags/SLAMoutput/CLEAN_ON.pcd"
+        cube_side_length: 60.
+        map_file_path: "./test.pcd"
 
         common:
             lid_topic:  "/sonar_point_cloud"
@@ -28,7 +28,7 @@
             acc_cov: 0.001
             gyr_cov: 0.000001
             laser_point_cov_xy: 0.0001
-            laser_point_cov_z: 0.0001
+            laser_point_cov_z: 0.2
             fov_degree:    90.0
             det_range:     15.0
             extrinsic_T: [ 0.09382, -0.02148, 0.11593 ]
@@ -37,7 +37,7 @@
                             -0.258819045, 0.0, 0.965925826 ]
 
         dvl:
-            enable: false
+            enable: true
             topic: "/auv/dvl"
             extrinsic_T: [ -0.079, -0.09691, -0.25938 ]
             extrinsic_R: [ 1., 0., 0.,
@@ -49,15 +49,15 @@
             dvl_timeout: 0.25
 
         pressure:
-            enable: false
+            enable: true
             topic: "/auv/pressure/scaled2"
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
             pressure_timeout: 0.25
-            pressure_cov: 1.0e8
-            innovation_gate_sigma: 3.0
+            pressure_cov: 4.0652529e4
+            innovation_gate_sigma: 0.0
 
         magnetometer:
-            enable: false
+            enable: true
             topic: "/auv/imu/magnetic_field"
             extrinsic_R: [ 1.0, 0.0, 0.0,
                            0.0, 1.0, 0.0,
