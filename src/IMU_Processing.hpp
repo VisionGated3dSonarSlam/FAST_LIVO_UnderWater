@@ -51,11 +51,12 @@ class ImuProcess
   // bleeding into b_dvl/b_pressure via the P-inverse cross-correlations and
   // breaking DVL/pressure observability mid-bag.
   void set_initial_aux_cov(const V3D &b_dvl, double b_pressure);
-  void set_initial_mag_cov(double b_mag_init, double b_mag_proc);
   void set_gravity(const double gravity_m_s2);
   bool IsInitialized() const;
-  Eigen::Matrix<double, 15, 15> Q;
-  void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  Eigen::Matrix<double, process_noise_ikfom::DOF, process_noise_ikfom::DOF> Q;
+  void Process(const MeasureGroup &meas,
+               esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+               PointCloudXYZI::Ptr pcl_un_);
 
   // Forward-propagate the EKF from last_lidar_end_time_ to target_time, using
   // IMU samples from imu_msgs whose stamp is within that window. Final
@@ -64,7 +65,7 @@ class ImuProcess
   // Pre-init or non-positive dt: no-op, returns true. Returns false only on
   // missing IMU data when one is genuinely needed.
   bool PartialPropagate(double target_time,
-                        esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state,
+                        esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
                         const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs);
 
   V3D cov_acc;
@@ -78,13 +79,15 @@ class ImuProcess
   double init_cov_grav;
   V3D init_cov_b_dvl;
   double init_cov_b_pressure;
-  double init_cov_b_mag;
-  double cov_bias_mag;
   double first_lidar_time;
 
  private:
-  void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, int &N);
-  void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+  void IMU_init(const MeasureGroup &meas,
+                esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+                int &N);
+  void UndistortPcl(const MeasureGroup &meas,
+                    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+                    PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   // sensor_msgs::ImuConstPtr last_imu_;
@@ -124,8 +127,6 @@ ImuProcess::ImuProcess()
   // ~21 cm equivalent pressure bias and to drift b_dvl by O(1e-3) m/s.
   init_cov_b_dvl = V3D(1e-8, 1e-8, 1e-8);
   init_cov_b_pressure = 1e4;
-  init_cov_b_mag = 1e6;
-  cov_bias_mag = 0.001;
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
@@ -203,12 +204,6 @@ void ImuProcess::set_initial_aux_cov(const V3D &b_dvl, double b_pressure)
   init_cov_b_pressure = b_pressure;
 }
 
-void ImuProcess::set_initial_mag_cov(double b_mag_init, double b_mag_proc)
-{
-  init_cov_b_mag = b_mag_init;
-  cov_bias_mag = b_mag_proc;
-}
-
 void ImuProcess::set_gravity(const double gravity_m_s2)
 {
   gravity_m_s2_ = gravity_m_s2;
@@ -219,7 +214,10 @@ bool ImuProcess::IsInitialized() const
   return !imu_need_init_;
 }
 
-void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, int &N)
+void ImuProcess::IMU_init(
+    const MeasureGroup &meas,
+    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+    int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
@@ -262,7 +260,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
   kf_state.change_x(init_state);
 
-  esekfom::esekf<state_ikfom, 15, input_ikfom>::cov init_P = kf_state.get_P();
+  esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom>::cov init_P = kf_state.get_P();
   init_P.setIdentity();
   init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
@@ -277,13 +275,15 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(24,24) = init_cov_b_dvl[1];
   init_P(25,25) = init_cov_b_dvl[2];
   init_P(26,26) = init_cov_b_pressure;
-  init_P(27,27) = init_P(28,28) = init_P(29,29) = init_cov_b_mag;
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 
 }
 
-void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
+void ImuProcess::UndistortPcl(
+    const MeasureGroup &meas,
+    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+    PointCloudXYZI &pcl_out)
 {
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
@@ -345,7 +345,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    Q.block<3, 3>(12, 12).diagonal() = V3D(cov_bias_mag, cov_bias_mag, cov_bias_mag);
     kf_state.predict(dt, Q, in);
 
     /* save the poses at each IMU measurements */
@@ -406,7 +405,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   }
 }
 
-void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state, PointCloudXYZI::Ptr cur_pcl_un_)
+void ImuProcess::Process(
+    const MeasureGroup &meas,
+    esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
+    PointCloudXYZI::Ptr cur_pcl_un_)
 {
   if(meas.imu.empty()) {return;};
   assert(meas.lidar != nullptr);
@@ -436,11 +438,15 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 }
 
 bool ImuProcess::PartialPropagate(double target_time,
-                                  esekfom::esekf<state_ikfom, 15, input_ikfom> &kf_state,
+                                  esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom> &kf_state,
                                   const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs)
 {
   // Skip when EKF is not ready or target is in the past relative to current state.
   if (imu_need_init_) return true;
+  if (last_lidar_end_time_ < 0.0 && last_imu_)
+  {
+    last_lidar_end_time_ = rclcpp::Time(last_imu_->header.stamp).seconds();
+  }
   if (last_lidar_end_time_ < 0.0) return true;
   if (target_time <= last_lidar_end_time_ + 1e-9) return true;
 
@@ -486,7 +492,6 @@ bool ImuProcess::PartialPropagate(double target_time,
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    Q.block<3, 3>(12, 12).diagonal() = V3D(cov_bias_mag, cov_bias_mag, cov_bias_mag);
     kf_state.predict(dt, Q, in);
 
     last_lidar_end_time_ = seg_end;
@@ -507,6 +512,18 @@ bool ImuProcess::PartialPropagate(double target_time,
     angvel_last = angvel_avr - st.bg;
     acc_s_last = st.rot * (acc_avr - st.ba);
     for (int i = 0; i < 3; ++i) acc_s_last[i] += st.grav[i];
+  }
+
+  for (const auto &imu : imu_msgs)
+  {
+    if (rclcpp::Time(imu->header.stamp).seconds() <= last_lidar_end_time_ + 1e-9)
+    {
+      last_imu_ = imu;
+    }
+    else
+    {
+      break;
+    }
   }
 
   return last_lidar_end_time_ >= target_time - 1e-9;

@@ -4,12 +4,17 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Cholesky>
+#include <Eigen/Eigenvalues>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
@@ -17,12 +22,14 @@
 #include <sensor_msgs/msg/magnetic_field.hpp>
 
 #include "common_lib.h"
+#include "dvl_measurement_model.hpp"
+#include "magnetometer_heading_model.hpp"
 #include "use-ikfom.hpp"
 
 class AuxiliarySensorFusion
 {
 public:
-    using Ekf = esekfom::esekf<state_ikfom, 15, input_ikfom>;
+    using Ekf = esekfom::esekf<state_ikfom, process_noise_ikfom::DOF, input_ikfom>;
     using DvlMsg = geometry_msgs::msg::TwistWithCovarianceStamped;
     using PressureMsg = sensor_msgs::msg::FluidPressure;
     using MagMsg = sensor_msgs::msg::MagneticField;
@@ -108,6 +115,51 @@ public:
         {
             return mag_count > 0 ? mag_res_norm_sum / static_cast<double>(mag_count) : 0.0;
         }
+
+        void merge(const UpdateSummary &other)
+        {
+            dvl_count += other.dvl_count;
+            dvl_accepted += other.dvl_accepted;
+            dvl_rejected += other.dvl_rejected;
+            pressure_count += other.pressure_count;
+            pressure_accepted += other.pressure_accepted;
+            pressure_rejected += other.pressure_rejected;
+            mag_count += other.mag_count;
+            mag_accepted += other.mag_accepted;
+            mag_rejected += other.mag_rejected;
+            dvl_res_norm_sum += other.dvl_res_norm_sum;
+            dvl_res_norm_max = std::max(dvl_res_norm_max, other.dvl_res_norm_max);
+            dvl_res_sum += other.dvl_res_sum;
+            dvl_res_abs_max = dvl_res_abs_max.cwiseMax(other.dvl_res_abs_max);
+            dvl_meas_sum += other.dvl_meas_sum;
+            dvl_pred_sum += other.dvl_pred_sum;
+            dvl_body_vel_sum += other.dvl_body_vel_sum;
+            pressure_res_depth_sum += other.pressure_res_depth_sum;
+            pressure_res_depth_max = std::max(pressure_res_depth_max, other.pressure_res_depth_max);
+            mag_res_norm_sum += other.mag_res_norm_sum;
+            mag_res_norm_max = std::max(mag_res_norm_max, other.mag_res_norm_max);
+            dvl_updated = dvl_updated || other.dvl_updated;
+            pressure_updated = pressure_updated || other.pressure_updated;
+            mag_updated = mag_updated || other.mag_updated;
+        }
+    };
+
+    struct JointMeasurementSet
+    {
+        std::vector<DvlMsg::ConstSharedPtr> dvl_msgs;
+        std::vector<PressureMsg::ConstSharedPtr> pressure_msgs;
+        V3D raw_gyro = V3D::Zero();
+        M3D raw_gyro_covariance = M3D::Zero();
+        bool raw_gyro_valid = false;
+        bool raw_gyro_covariance_valid = false;
+        int dvl_count = 0;
+        int pressure_count = 0;
+
+        int max_rows() const
+        {
+            return (dvl_count > 0 ? 3 : 0) +
+                   (pressure_count > 0 ? 1 : 0);
+        }
     };
 
     void declare_parameters(rclcpp::Node &node)
@@ -129,29 +181,25 @@ public:
         node.declare_parameter<double>("dvl.velocity_cov", 4e-4);
         node.declare_parameter<double>("dvl.innovation_gate_sigma", 5.0);
         node.declare_parameter<double>("dvl.bias_init_cov", 1e-8);
-        node.declare_parameter<bool>("dvl.attitude_update_en", true);
         node.declare_parameter<double>("pressure.pressure_cov", 1e4);
         node.declare_parameter<double>("pressure.innovation_gate_sigma", 0.0);
         node.declare_parameter<double>("pressure.fluid_density", 1025.0);
         node.declare_parameter<double>("pressure.gravity", 9.80665);
         node.declare_parameter<double>("pressure.surface_pressure", 101325.0);
         node.declare_parameter<double>("pressure.surface_z", 0.0);
-        node.declare_parameter<bool>("pressure.use_attitude_lever_arm", false);
-        node.declare_parameter<bool>("aux.pressure_before_dvl", false);
 
         node.declare_parameter<bool>("magnetometer.enable", false);
         node.declare_parameter<std::string>("magnetometer.topic", "/auv/imu/magnetic_field");
-        // Field expressed in camera_init/body-at-start frame. The IEKF state frame is
-        // camera_init, so this is the reference used by h = R_ci_body^T * B_ci.
-        node.declare_parameter<std::vector<double>>("magnetometer.earth_field_imu", {0.0, 0.0, 0.0});
+        node.declare_parameter<std::vector<double>>("magnetometer.extrinsic_R",
+            {1., 0., 0.,  0., 1., 0.,  0., 0., 1.});
         node.declare_parameter<std::vector<double>>("magnetometer.hard_iron_offset", {0.0, 0.0, 0.0});
         node.declare_parameter<std::vector<double>>("magnetometer.soft_iron_matrix",
             {1., 0., 0.,  0., 1., 0.,  0., 0., 1.});
         node.declare_parameter<double>("magnetometer.mag_cov", 1849.0);
-        node.declare_parameter<double>("magnetometer.b_mag_init_cov", 1e6);
-        node.declare_parameter<double>("magnetometer.b_mag_proc_cov", 0.001);
+        node.declare_parameter<double>("magnetometer.heading_cov_floor", 1e-6);
         node.declare_parameter<double>("magnetometer.innovation_gate_sigma", 3.0);
         node.declare_parameter<double>("magnetometer.mag_timeout", 0.5);
+        node.declare_parameter<std::string>("magnetometer.debug_csv_path", "");
     }
 
     void load_parameters(rclcpp::Node &node)
@@ -162,7 +210,6 @@ public:
         node.get_parameter_or<double>("dvl.velocity_cov", dvl_velocity_cov_, 4e-4);
         node.get_parameter_or<double>("dvl.innovation_gate_sigma", dvl_innovation_gate_sigma_, 5.0);
         node.get_parameter_or<double>("dvl.bias_init_cov", dvl_b_init_cov_, 1e-8);
-        node.get_parameter_or<bool>("dvl.attitude_update_en", dvl_attitude_update_en_, true);
 
         node.get_parameter_or<bool>("pressure.enable", pressure_enable_, false);
         node.get_parameter_or<std::string>("pressure.topic", pressure_topic_, "/auv/pressure/scaled2");
@@ -173,8 +220,6 @@ public:
         node.get_parameter_or<double>("pressure.gravity", pressure_gravity_, 9.80665);
         node.get_parameter_or<double>("pressure.surface_pressure", pressure_surface_pressure_, 101325.0);
         node.get_parameter_or<double>("pressure.surface_z", pressure_surface_z_, 0.0);
-        node.get_parameter_or<bool>("pressure.use_attitude_lever_arm", pressure_use_attitude_lever_arm_, false);
-        node.get_parameter_or<bool>("aux.pressure_before_dvl", pressure_before_dvl_, false);
 
         std::vector<double> dvl_T;
         std::vector<double> dvl_R;
@@ -221,21 +266,30 @@ public:
         node.get_parameter_or<bool>("magnetometer.enable", mag_enable_, false);
         node.get_parameter_or<std::string>("magnetometer.topic", mag_topic_, "/auv/imu/magnetic_field");
         node.get_parameter_or<double>("magnetometer.mag_cov", mag_cov_, 1849.0);
-        node.get_parameter_or<double>("magnetometer.b_mag_init_cov", mag_b_init_cov_, 1e6);
-        node.get_parameter_or<double>("magnetometer.b_mag_proc_cov", mag_b_proc_cov_, 0.001);
+        node.get_parameter_or<double>("magnetometer.heading_cov_floor", mag_heading_cov_floor_, 1e-6);
         node.get_parameter_or<double>("magnetometer.innovation_gate_sigma", mag_innovation_gate_sigma_, 3.0);
         node.get_parameter_or<double>("magnetometer.mag_timeout", mag_timeout_, 0.5);
+        node.get_parameter_or<std::string>("magnetometer.debug_csv_path", mag_debug_csv_path_, "");
 
-        std::vector<double> earth_field, hard_iron, soft_iron;
-        node.get_parameter_or<std::vector<double>>("magnetometer.earth_field_imu", earth_field, {0., 0., 0.});
+        std::vector<double> mag_extrinsic_R, hard_iron, soft_iron;
+        node.get_parameter_or<std::vector<double>>("magnetometer.extrinsic_R", mag_extrinsic_R,
+            {1., 0., 0.,  0., 1., 0.,  0., 0., 1.});
         node.get_parameter_or<std::vector<double>>("magnetometer.hard_iron_offset", hard_iron, {0., 0., 0.});
         node.get_parameter_or<std::vector<double>>("magnetometer.soft_iron_matrix", soft_iron,
             {1., 0., 0.,  0., 1., 0.,  0., 0., 1.});
 
-        if (earth_field.size() == 3)
-            mag_earth_field_imu_ << earth_field[0], earth_field[1], earth_field[2];
+        if (mag_extrinsic_R.size() == 9)
+        {
+            mag_R_BM_ << mag_extrinsic_R[0], mag_extrinsic_R[1], mag_extrinsic_R[2],
+                         mag_extrinsic_R[3], mag_extrinsic_R[4], mag_extrinsic_R[5],
+                         mag_extrinsic_R[6], mag_extrinsic_R[7], mag_extrinsic_R[8];
+        }
         else
-            mag_earth_field_imu_.setZero();
+        {
+            RCLCPP_WARN(node.get_logger(),
+                        "magnetometer.extrinsic_R must have 9 values. Using identity rotation.");
+            mag_R_BM_.setIdentity();
+        }
 
         if (hard_iron.size() == 3)
             mag_hard_iron_ << hard_iron[0], hard_iron[1], hard_iron[2];
@@ -263,7 +317,12 @@ public:
         pressure_innovation_gate_sigma_ = std::max(0.0, pressure_innovation_gate_sigma_);
         pressure_fluid_density_ = std::max(1e-6, pressure_fluid_density_);
         pressure_gravity_ = std::max(1e-6, pressure_gravity_);
-        mag_cov_ = std::max(1e-6, mag_cov_);
+        // Magnetometer covariance may be expressed in Tesla^2 in simulation
+        // (around 1e-15) or in uT^2 for real bags. Keep only a numerical floor
+        // here; a 1e-6 floor silently disables Tesla-scale magnetometer fusion.
+        mag_cov_ = std::max(1e-18, mag_cov_);
+        mag_heading_cov_floor_ = std::max(1e-12, mag_heading_cov_floor_);
+        mag_innovation_gate_sigma_ = std::max(0.0, mag_innovation_gate_sigma_);
     }
 
     void create_subscriptions(rclcpp::Node &node,
@@ -294,10 +353,137 @@ public:
         }
     }
 
-    // Time-ordered event fusion: walks all DVL/pressure/mag measurements in
-    // [begin_time, end_time] in chronological order, calling propagate_to(t)
-    // before each so the EKF state is at the measurement's own timestamp when
-    // the residual and update are computed. This avoids the previous
+    JointMeasurementSet take_joint_measurements(
+        double begin_time,
+        double end_time,
+        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs)
+    {
+        JointMeasurementSet joint;
+        if (dvl_enable_)
+        {
+            joint.dvl_msgs = take_dvl_measurements(begin_time, end_time);
+            joint.dvl_count = static_cast<int>(joint.dvl_msgs.size());
+            if (!joint.dvl_msgs.empty())
+            {
+                const double dvl_time = get_time_sec(joint.dvl_msgs.back()->header.stamp);
+                const ImuAngularSample imu_sample =
+                    imu_angular_sample_at_time(dvl_time, imu_msgs);
+                joint.raw_gyro = imu_sample.raw_gyro;
+                joint.raw_gyro_covariance = imu_sample.covariance;
+                joint.raw_gyro_valid = imu_sample.valid;
+                joint.raw_gyro_covariance_valid = imu_sample.covariance_valid;
+            }
+        }
+        if (pressure_enable_)
+        {
+            joint.pressure_msgs = take_pressure_measurements(begin_time, end_time);
+            joint.pressure_count = static_cast<int>(joint.pressure_msgs.size());
+        }
+        return joint;
+    }
+
+    UpdateSummary summarize_joint_measurements(const JointMeasurementSet &joint,
+                                               const state_ikfom &state,
+                                               const typename Ekf::cov &P) const
+    {
+        UpdateSummary summary;
+        summary.dvl_count = joint.dvl_count;
+        summary.pressure_count = joint.pressure_count;
+        summary.pressure_accepted = joint.pressure_count > 0 ? 1 : 0;
+        summary.pressure_rejected = summary.pressure_count - summary.pressure_accepted;
+        summary.pressure_updated = !joint.pressure_msgs.empty();
+
+        if (!joint.dvl_msgs.empty())
+        {
+            const DvlLinearization dvl = build_joint_dvl_linearization(joint, state);
+            if (dvl.valid)
+            {
+                summary.dvl_res_norm_sum = dvl.residual.norm();
+                summary.dvl_res_norm_max = dvl.residual.norm();
+                summary.dvl_res_sum = dvl.residual;
+                summary.dvl_res_abs_max = dvl.residual.cwiseAbs();
+                summary.dvl_meas_sum = dvl.measurement;
+                summary.dvl_pred_sum = dvl.prediction;
+                summary.dvl_body_vel_sum = dvl.dvl_origin_velocity_vehicle;
+            }
+            const bool accepted = dvl.valid && dvl_passes_gate(dvl, P);
+            summary.dvl_accepted = accepted ? 1 : 0;
+            summary.dvl_rejected = summary.dvl_count - summary.dvl_accepted;
+            summary.dvl_updated = accepted;
+        }
+        if (!joint.pressure_msgs.empty())
+        {
+            double pressure_sum = 0.0;
+            for (const auto &msg : joint.pressure_msgs)
+            {
+                pressure_sum += msg->fluid_pressure;
+            }
+            const double mean_pressure = pressure_sum / static_cast<double>(joint.pressure_msgs.size());
+            const double residual_depth = (mean_pressure - pressure_prediction(state)) / pressure_scale();
+            summary.pressure_res_depth_sum = std::abs(residual_depth);
+            summary.pressure_res_depth_max = std::abs(residual_depth);
+        }
+        return summary;
+    }
+
+    int append_joint_measurement_rows(const JointMeasurementSet &joint,
+                                      const state_ikfom &state,
+                                      const typename Ekf::cov &P,
+                                      Eigen::MatrixXd &H,
+                                      Eigen::VectorXd &h,
+                                      int row)
+    {
+        if (!joint.dvl_msgs.empty())
+        {
+            const DvlLinearization dvl = build_joint_dvl_linearization(joint, state);
+            if (dvl.valid && dvl_passes_gate(dvl, P))
+            {
+                Eigen::LLT<M3D> llt(dvl.R);
+                const M3D L = llt.matrixL();
+                const M3D H_whitener =
+                    L.template triangularView<Eigen::Lower>().solve(M3D::Identity());
+                H.block(row, 0, 3, state_ikfom::DOF) = H_whitener * dvl.H;
+                h.segment(row, 3) = H_whitener * dvl.residual;
+                row += 3;
+            }
+        }
+
+        if (!joint.pressure_msgs.empty() && finalize_pressure_reference_if_needed(state))
+        {
+            double pressure_sum = 0.0;
+            double cov_sum = 0.0;
+            for (const auto &msg : joint.pressure_msgs)
+            {
+                pressure_sum += msg->fluid_pressure;
+                cov_sum += covariance_or_fallback(msg->variance, pressure_cov_);
+            }
+            const double mean_pressure = pressure_sum / static_cast<double>(joint.pressure_msgs.size());
+            const double residual = mean_pressure - pressure_prediction(state);
+            const double cov = cov_sum / static_cast<double>(joint.pressure_msgs.size());
+            if (pressure_innovation_gate_sigma_ <= 0.0 ||
+                std::abs(residual) <= pressure_innovation_gate_sigma_ * std::sqrt(cov))
+            {
+                Eigen::MatrixXd H_pressure = Eigen::MatrixXd::Zero(1, state_ikfom::DOF);
+                // Pressure measures World-z depth, but it must not correct
+                // horizontal x/y. Use the World-z prediction and let the EKF
+                // correct only local depth.
+                H_pressure(0, 2) = -pressure_scale() * world_z_axis_in_camera_init().z();
+                H_pressure(0, 26) = 1.0;
+                const double inv_sigma = 1.0 / std::sqrt(cov);
+                H.row(row) = H_pressure.row(0) * inv_sigma;
+                h(row) = residual * inv_sigma;
+                ++row;
+            }
+        }
+
+        return row;
+    }
+
+    // Time-ordered event fusion for no-scan operation: walks all auxiliary
+    // measurements in [begin_time, end_time] in chronological order. Magnetic
+    // samples still use the same separate constrained scalar update as scan mode.
+    // The propagator advances the EKF before each event so the residual is
+    // evaluated at the measurement's own timestamp. This avoids the previous
     // scan-epoch-batched fusion where every aux measurement was evaluated at
     // the trailing sonar/state time, producing wrong velocity residuals
     // proportional to (state_time - measurement_time).
@@ -306,8 +492,7 @@ public:
                                                double end_time,
                                                const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
                                                Ekf &kf,
-                                               PropagatorFn &&propagate_to,
-                                               bool allow_dvl_attitude_update = true)
+                                               PropagatorFn &&propagate_to)
     {
         UpdateSummary summary;
 
@@ -328,15 +513,30 @@ public:
             double t;
             Kind kind;
             std::size_t idx;
+            bool allow_mag_update = true;
         };
         std::vector<Event> events;
         events.reserve(dvl_msgs.size() + pres_msgs.size() + mag_msgs.size());
         for (std::size_t i = 0; i < dvl_msgs.size(); ++i)
-            events.push_back({get_time_sec(dvl_msgs[i]->header.stamp), K_DVL, i});
+            events.push_back({get_time_sec(dvl_msgs[i]->header.stamp), K_DVL, i, true});
         for (std::size_t i = 0; i < pres_msgs.size(); ++i)
-            events.push_back({get_time_sec(pres_msgs[i]->header.stamp), K_PRES, i});
-        for (std::size_t i = 0; i < mag_msgs.size(); ++i)
-            events.push_back({get_time_sec(mag_msgs[i]->header.stamp), K_MAG, i});
+            events.push_back({get_time_sec(pres_msgs[i]->header.stamp), K_PRES, i, true});
+        if (!mag_msgs.empty() && !mag_reference_is_ready())
+        {
+            // Consume the buffered high-rate samples immediately so the local
+            // heading reference is ready before stand-alone DVL can affect
+            // attitude. Only the newest sample may perform a state update.
+            for (std::size_t i = 0; i < mag_msgs.size(); ++i)
+            {
+                events.push_back({get_time_sec(mag_msgs[i]->header.stamp), K_MAG, i,
+                                  i + 1 == mag_msgs.size()});
+            }
+        }
+        else if (!mag_msgs.empty())
+        {
+            const std::size_t i = mag_msgs.size() - 1;
+            events.push_back({get_time_sec(mag_msgs[i]->header.stamp), K_MAG, i, true});
+        }
         std::stable_sort(events.begin(), events.end(),
                          [](const Event &a, const Event &b) { return a.t < b.t; });
 
@@ -348,10 +548,10 @@ public:
                 continue;
             }
 
-            // Body angular velocity at the measurement time. We pick the IMU
-            // sample closest to ev.t; gives a closer omega than always using
-            // the most recent IMU when t_aux is mid-interval.
-            const V3D omega_body = body_omega_at_time(ev.t, imu_msgs, kf.get_x());
+            // Use the raw IMU angular rate closest to the auxiliary timestamp.
+            // The model removes the current gyro-bias estimate for lever-arm
+            // compensation, while DVL directly observes velocity and DVL bias.
+            const ImuAngularSample imu_sample = imu_angular_sample_at_time(ev.t, imu_msgs);
 
             switch (ev.kind)
             {
@@ -359,20 +559,22 @@ public:
                 {
                     const auto &msg = *dvl_msgs[ev.idx];
                     const state_ikfom state = kf.get_x();
-                    const V3D measurement  = dvl_measurement(msg);
-                    const V3D prediction   = dvl_prediction(state, omega_body);
-                    const V3D body_velocity = dvl_sensor_origin_velocity_body(state, omega_body);
-                    const V3D residual = measurement - prediction;
+                    const DvlLinearization dvl =
+                        build_dvl_linearization(make_dvl_observation(msg, imu_sample, state), state);
                     summary.dvl_count++;
-                    summary.dvl_res_norm_sum += residual.norm();
-                    summary.dvl_res_norm_max = std::max(summary.dvl_res_norm_max, residual.norm());
-                    summary.dvl_res_sum += residual;
-                    summary.dvl_res_abs_max = summary.dvl_res_abs_max.cwiseMax(residual.cwiseAbs());
-                    summary.dvl_meas_sum += measurement;
-                    summary.dvl_pred_sum += prediction;
-                    summary.dvl_body_vel_sum += body_velocity;
-                    const bool accepted = apply_dvl_update(
-                        msg, omega_body, kf, allow_dvl_attitude_update && dvl_attitude_update_en_);
+                    if (dvl.valid)
+                    {
+                        summary.dvl_res_norm_sum += dvl.residual.norm();
+                        summary.dvl_res_norm_max =
+                            std::max(summary.dvl_res_norm_max, dvl.residual.norm());
+                        summary.dvl_res_sum += dvl.residual;
+                        summary.dvl_res_abs_max =
+                            summary.dvl_res_abs_max.cwiseMax(dvl.residual.cwiseAbs());
+                        summary.dvl_meas_sum += dvl.measurement;
+                        summary.dvl_pred_sum += dvl.prediction;
+                        summary.dvl_body_vel_sum += dvl.dvl_origin_velocity_vehicle;
+                    }
+                    const bool accepted = apply_dvl_update(msg, imu_sample, kf);
                     summary.dvl_accepted += accepted ? 1 : 0;
                     summary.dvl_rejected += accepted ? 0 : 1;
                     summary.dvl_updated = accepted || summary.dvl_updated;
@@ -396,14 +598,19 @@ public:
                 case K_MAG:
                 {
                     const auto &msg = *mag_msgs[ev.idx];
-                    const V3D residual = mag_residual(msg, kf.get_x());
-                    summary.mag_count++;
-                    summary.mag_res_norm_sum += residual.norm();
-                    summary.mag_res_norm_max = std::max(summary.mag_res_norm_max, residual.norm());
-                    const bool accepted = apply_mag_update(msg, kf);
-                    summary.mag_accepted += accepted ? 1 : 0;
-                    summary.mag_rejected += accepted ? 0 : 1;
-                    summary.mag_updated = accepted || summary.mag_updated;
+                    double residual = 0.0;
+                    const bool accepted = apply_mag_update(
+                        msg, kf, &residual, ev.allow_mag_update);
+                    if (ev.allow_mag_update)
+                    {
+                        summary.mag_count++;
+                        summary.mag_res_norm_sum += std::abs(residual);
+                        summary.mag_res_norm_max =
+                            std::max(summary.mag_res_norm_max, std::abs(residual));
+                        summary.mag_accepted += accepted ? 1 : 0;
+                        summary.mag_rejected += accepted ? 0 : 1;
+                        summary.mag_updated = accepted || summary.mag_updated;
+                    }
                     break;
                 }
             }
@@ -415,11 +622,10 @@ public:
     UpdateSummary process_interval(double begin_time,
                                    double end_time,
                                    const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
-                                   Ekf &kf,
-                                   bool allow_dvl_attitude_update = true)
+                                   Ekf &kf)
     {
         UpdateSummary summary;
-        const V3D omega_body = latest_body_omega(imu_msgs, kf.get_x());
+        const ImuAngularSample imu_sample = latest_imu_angular_sample(imu_msgs);
 
         auto process_dvl = [&]()
         {
@@ -427,20 +633,22 @@ public:
             for (const auto &msg : messages)
             {
                 const state_ikfom state = kf.get_x();
-                const V3D measurement = dvl_measurement(*msg);
-                const V3D prediction = dvl_prediction(state, omega_body);
-                const V3D body_velocity = dvl_sensor_origin_velocity_body(state, omega_body);
-                const V3D residual = measurement - prediction;
+                const DvlLinearization dvl =
+                    build_dvl_linearization(make_dvl_observation(*msg, imu_sample, state), state);
                 summary.dvl_count++;
-                summary.dvl_res_norm_sum += residual.norm();
-                summary.dvl_res_norm_max = std::max(summary.dvl_res_norm_max, residual.norm());
-                summary.dvl_res_sum += residual;
-                summary.dvl_res_abs_max = summary.dvl_res_abs_max.cwiseMax(residual.cwiseAbs());
-                summary.dvl_meas_sum += measurement;
-                summary.dvl_pred_sum += prediction;
-                summary.dvl_body_vel_sum += body_velocity;
-                const bool accepted = apply_dvl_update(
-                    *msg, omega_body, kf, allow_dvl_attitude_update && dvl_attitude_update_en_);
+                if (dvl.valid)
+                {
+                    summary.dvl_res_norm_sum += dvl.residual.norm();
+                    summary.dvl_res_norm_max =
+                        std::max(summary.dvl_res_norm_max, dvl.residual.norm());
+                    summary.dvl_res_sum += dvl.residual;
+                    summary.dvl_res_abs_max =
+                        summary.dvl_res_abs_max.cwiseMax(dvl.residual.cwiseAbs());
+                    summary.dvl_meas_sum += dvl.measurement;
+                    summary.dvl_pred_sum += dvl.prediction;
+                    summary.dvl_body_vel_sum += dvl.dvl_origin_velocity_vehicle;
+                }
+                const bool accepted = apply_dvl_update(*msg, imu_sample, kf);
                 summary.dvl_accepted += accepted ? 1 : 0;
                 summary.dvl_rejected += accepted ? 0 : 1;
                 summary.dvl_updated = accepted || summary.dvl_updated;
@@ -464,33 +672,46 @@ public:
             }
         };
 
-        if (pressure_before_dvl_)
+        if (dvl_enable_) process_dvl();
+        if (pressure_enable_) process_pressure();
+
+        return summary;
+    }
+
+    // At a scan epoch use only the newest magnetic sample in the interval. All
+    // older samples are consumed, so no sample can be fused twice and the
+    // selected timestamp remains close to the corrected scan-end state.
+    UpdateSummary process_magnetometer_interval(double begin_time,
+                                                double end_time,
+                                                Ekf &kf)
+    {
+        UpdateSummary summary;
+        if (!mag_enable_)
         {
-            if (pressure_enable_) process_pressure();
-            if (dvl_enable_) process_dvl();
+            return summary;
         }
-        else
+        const auto messages = take_mag_measurements(begin_time, end_time);
+        if (messages.empty())
         {
-            if (dvl_enable_) process_dvl();
-            if (pressure_enable_) process_pressure();
+            return summary;
         }
 
-        if (mag_enable_)
+        if (!mag_reference_is_ready())
         {
-            const auto messages = take_mag_measurements(begin_time, end_time);
-            for (const auto &msg : messages)
+            for (std::size_t i = 0; i + 1 < messages.size(); ++i)
             {
-                const V3D residual = mag_residual(*msg, kf.get_x());
-                summary.mag_count++;
-                summary.mag_res_norm_sum += residual.norm();
-                summary.mag_res_norm_max = std::max(summary.mag_res_norm_max, residual.norm());
-                const bool accepted = apply_mag_update(*msg, kf);
-                summary.mag_accepted += accepted ? 1 : 0;
-                summary.mag_rejected += accepted ? 0 : 1;
-                summary.mag_updated = accepted || summary.mag_updated;
+                apply_mag_update(*messages[i], kf, nullptr, false);
             }
         }
 
+        summary.mag_count = 1;
+        double residual = 0.0;
+        const bool accepted = apply_mag_update(*messages.back(), kf, &residual);
+        summary.mag_res_norm_sum = std::abs(residual);
+        summary.mag_res_norm_max = std::abs(residual);
+        summary.mag_accepted = accepted ? 1 : 0;
+        summary.mag_rejected = accepted ? 0 : 1;
+        summary.mag_updated = accepted;
         return summary;
     }
 
@@ -531,34 +752,44 @@ public:
     double dvl_velocity_cov() const { return dvl_velocity_cov_; }
     double dvl_innovation_gate_sigma() const { return dvl_innovation_gate_sigma_; }
     double dvl_b_init_cov() const { return dvl_b_init_cov_; }
-    double mag_b_init_cov() const { return mag_b_init_cov_; }
-    double mag_b_proc_cov() const { return mag_b_proc_cov_; }
 
-    // Set the camera_init frame's z-coordinate in the world frame so the pressure
-    // depth model works correctly when world_to_camera_init_T.z != 0.
-    // Call this after loading world_to_camera_init_T from config.
-    void set_camera_init_z_in_world(double z) { camera_init_z_in_world_ = z; }
-
-    // The IEKF state lives in the camera_init frame, which equals the body frame at t=0
-    // (state.rot = Identity at startup). B_reference must therefore be expressed in
-    // camera_init frame = B_imu (the field measured in the initial body frame). No
-    // rotation into world coordinates is needed or correct here.
-    void apply_initial_rotation(const M3D & /*R_BtoW*/)
+    // Pressure measures depth along the world vertical axis, while the FAST-LIO
+    // state is expressed in camera_init. Store the static camera_init pose so the
+    // pressure model can project local sensor position onto world z.
+    void set_camera_init_pose_in_world(const V3D &t, const M3D &R)
     {
-        mag_earth_field_world_ = mag_earth_field_imu_;
+        camera_init_T_in_world_ = t;
+        camera_init_R_in_world_ = R;
     }
-
-    const V3D &earth_field_world() const { return mag_earth_field_world_; }
 
 private:
-    static M3D skew(const V3D &v)
+    struct ImuAngularSample
     {
-        M3D out;
-        out << 0.0, -v.z(), v.y(),
-               v.z(), 0.0, -v.x(),
-               -v.y(), v.x(), 0.0;
-        return out;
-    }
+        V3D raw_gyro = V3D::Zero();
+        M3D covariance = M3D::Zero();
+        bool covariance_valid = false;
+        bool valid = false;
+    };
+
+    struct DvlObservation
+    {
+        V3D measurement = V3D::Zero();
+        M3D covariance = M3D::Identity();
+        ImuAngularSample imu;
+        bool valid = false;
+    };
+
+    struct DvlLinearization
+    {
+        V3D measurement = V3D::Zero();
+        V3D prediction = V3D::Zero();
+        V3D residual = V3D::Zero();
+        V3D dvl_origin_velocity_vehicle = V3D::Zero();
+        Eigen::Matrix<double, 3, state_ikfom::DOF> H =
+            Eigen::Matrix<double, 3, state_ikfom::DOF>::Zero();
+        M3D R = M3D::Identity();
+        bool valid = false;
+    };
 
     static bool finite_vector(const Eigen::VectorXd &v)
     {
@@ -581,24 +812,57 @@ private:
         return std::max(value, fallback);
     }
 
-    V3D latest_body_omega(const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
-                          const state_ikfom &state) const
+    ImuAngularSample imu_angular_sample(const sensor_msgs::msg::Imu &msg) const
+    {
+        ImuAngularSample sample;
+        const auto &gyro = msg.angular_velocity;
+        sample.raw_gyro = V3D(gyro.x, gyro.y, gyro.z);
+        sample.valid = sample.raw_gyro.allFinite();
+
+        if (msg.angular_velocity_covariance[0] < 0.0)
+        {
+            return sample;
+        }
+        M3D covariance;
+        covariance << msg.angular_velocity_covariance[0],
+                      msg.angular_velocity_covariance[1],
+                      msg.angular_velocity_covariance[2],
+                      msg.angular_velocity_covariance[3],
+                      msg.angular_velocity_covariance[4],
+                      msg.angular_velocity_covariance[5],
+                      msg.angular_velocity_covariance[6],
+                      msg.angular_velocity_covariance[7],
+                      msg.angular_velocity_covariance[8];
+        covariance = 0.5 * (covariance + covariance.transpose()).eval();
+        if (!covariance.allFinite() || covariance.cwiseAbs().maxCoeff() <= 1e-18)
+        {
+            return sample;
+        }
+        Eigen::SelfAdjointEigenSolver<M3D> solver(covariance);
+        if (solver.info() == Eigen::Success && solver.eigenvalues().minCoeff() >= -1e-12)
+        {
+            sample.covariance = covariance;
+            sample.covariance_valid = true;
+        }
+        return sample;
+    }
+
+    ImuAngularSample latest_imu_angular_sample(
+        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs) const
     {
         if (imu_msgs.empty())
         {
-            return V3D::Zero();
+            return ImuAngularSample{};
         }
-        const auto &gyro = imu_msgs.back()->angular_velocity;
-        return V3D(gyro.x, gyro.y, gyro.z) - V3D(state.bg[0], state.bg[1], state.bg[2]);
+        return imu_angular_sample(*imu_msgs.back());
     }
 
-    // Pick the IMU sample whose stamp is closest to target_t and return the
-    // body-frame angular velocity it implies (raw gyro minus current bg).
-    V3D body_omega_at_time(double target_t,
-                           const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs,
-                           const state_ikfom &state) const
+    // Pick the raw IMU sample whose stamp is closest to the DVL timestamp.
+    ImuAngularSample imu_angular_sample_at_time(
+        double target_t,
+        const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu_msgs) const
     {
-        if (imu_msgs.empty()) return V3D::Zero();
+        if (imu_msgs.empty()) return ImuAngularSample{};
         auto best = imu_msgs.begin();
         double best_diff = std::abs(get_time_sec((*best)->header.stamp) - target_t);
         for (auto it = imu_msgs.begin(); it != imu_msgs.end(); ++it)
@@ -606,8 +870,7 @@ private:
             const double d = std::abs(get_time_sec((*it)->header.stamp) - target_t);
             if (d < best_diff) { best_diff = d; best = it; }
         }
-        const auto &gyro = (*best)->angular_velocity;
-        return V3D(gyro.x, gyro.y, gyro.z) - V3D(state.bg[0], state.bg[1], state.bg[2]);
+        return imu_angular_sample(**best);
     }
 
     V3D dvl_measurement(const DvlMsg &msg) const
@@ -616,50 +879,156 @@ private:
         return V3D(linear.x, linear.y, linear.z);
     }
 
-    V3D dvl_sensor_origin_velocity_body(const state_ikfom &state, const V3D &omega_body) const
+    M3D dvl_measurement_covariance(const DvlMsg &msg) const
     {
-        const M3D R_wb = state.rot.toRotationMatrix();
-        const V3D body_velocity = R_wb.transpose() * V3D(state.vel[0], state.vel[1], state.vel[2]);
-        return body_velocity + omega_body.cross(dvl_T_);
-    }
+        M3D covariance;
+        covariance << msg.twist.covariance[0], msg.twist.covariance[1], msg.twist.covariance[2],
+                      msg.twist.covariance[6], msg.twist.covariance[7], msg.twist.covariance[8],
+                      msg.twist.covariance[12], msg.twist.covariance[13], msg.twist.covariance[14];
+        covariance = 0.5 * (covariance + covariance.transpose()).eval();
 
-    V3D dvl_prediction(const state_ikfom &state, const V3D &omega_body) const
-    {
-        return dvl_R_.transpose() * dvl_sensor_origin_velocity_body(state, omega_body) +
-               V3D(state.b_dvl[0], state.b_dvl[1], state.b_dvl[2]);
-    }
-
-    V3D dvl_residual(const DvlMsg &msg, const state_ikfom &state, const V3D &omega_body) const
-    {
-        return dvl_measurement(msg) - dvl_prediction(state, omega_body);
-    }
-
-    double pressure_sensor_z_ci(const state_ikfom &state) const
-    {
-        V3D pressure_offset_ci = V3D::Zero();
-        if (pressure_use_attitude_lever_arm_)
+        bool use_message_covariance = covariance.allFinite();
+        if (use_message_covariance)
         {
-            pressure_offset_ci = state.rot.toRotationMatrix() * pressure_T_;
+            Eigen::SelfAdjointEigenSolver<M3D> solver(covariance);
+            use_message_covariance =
+                solver.info() == Eigen::Success &&
+                solver.eigenvalues().minCoeff() >= -1e-12 &&
+                covariance.diagonal().minCoeff() > 1e-12;
+        }
+        if (!use_message_covariance)
+        {
+            covariance = M3D::Identity() * dvl_velocity_cov_;
         }
         else
         {
-            pressure_offset_ci.z() = pressure_T_.z();
+            for (int i = 0; i < 3; ++i)
+            {
+                covariance(i, i) = std::max(covariance(i, i), dvl_velocity_cov_);
+            }
         }
-        return state.pos[2] + pressure_offset_ci.z();
+        return covariance;
+    }
+
+    DvlObservation make_dvl_observation(const DvlMsg &msg,
+                                        const ImuAngularSample &imu_sample,
+                                        const state_ikfom &state) const
+    {
+        DvlObservation observation;
+        observation.measurement = dvl_measurement(msg);
+        observation.covariance = dvl_measurement_covariance(msg);
+        observation.imu = imu_sample;
+        observation.valid = observation.measurement.allFinite() &&
+                            observation.covariance.allFinite() &&
+                            observation.imu.valid;
+        return observation;
+    }
+
+    DvlLinearization build_dvl_linearization(const DvlObservation &observation,
+                                             const state_ikfom &state) const
+    {
+        DvlLinearization result;
+        if (!observation.valid)
+        {
+            return result;
+        }
+
+        const auto model = underwater_fastlio::dvl::evaluate(
+            state, observation.imu.raw_gyro, dvl_R_, dvl_T_);
+        result.measurement = observation.measurement;
+        result.prediction = model.prediction_dvl;
+        result.residual = result.measurement - result.prediction;
+        result.dvl_origin_velocity_vehicle = model.dvl_origin_velocity_vehicle;
+        result.H = model.H;
+        result.R = observation.covariance;
+
+        if (observation.imu.covariance_valid && dvl_T_.squaredNorm() > 0.0)
+        {
+            const M3D C_DV = dvl_R_.transpose();
+            const M3D p_cross = underwater_fastlio::dvl::skew(dvl_T_);
+            result.R += C_DV * p_cross * observation.imu.covariance *
+                        p_cross.transpose() * C_DV.transpose();
+        }
+        result.R = 0.5 * (result.R + result.R.transpose()).eval();
+        Eigen::LLT<M3D> llt(result.R);
+        result.valid = result.measurement.allFinite() &&
+                       result.prediction.allFinite() &&
+                       result.residual.allFinite() &&
+                       result.H.allFinite() &&
+                       result.R.allFinite() &&
+                       llt.info() == Eigen::Success;
+        return result;
+    }
+
+    DvlLinearization build_joint_dvl_linearization(const JointMeasurementSet &joint,
+                                                   const state_ikfom &state) const
+    {
+        DvlObservation observation;
+        if (joint.dvl_msgs.empty())
+        {
+            return DvlLinearization{};
+        }
+
+        // The filter state is at the scan end. Use the newest DVL sample rather
+        // than averaging measurements acquired at different vehicle states.
+        const auto &msg = *joint.dvl_msgs.back();
+        observation.measurement = dvl_measurement(msg);
+        observation.covariance = dvl_measurement_covariance(msg);
+        observation.imu.raw_gyro = joint.raw_gyro;
+        observation.imu.covariance = joint.raw_gyro_covariance;
+        observation.imu.covariance_valid = joint.raw_gyro_covariance_valid;
+        observation.imu.valid = joint.raw_gyro_valid;
+        observation.valid = observation.measurement.allFinite() &&
+                            observation.covariance.allFinite() &&
+                            observation.imu.valid;
+        return build_dvl_linearization(observation, state);
+    }
+
+    bool dvl_passes_gate(const DvlLinearization &dvl,
+                         const typename Ekf::cov &P) const
+    {
+        if (!dvl.valid)
+        {
+            return false;
+        }
+        if (dvl_innovation_gate_sigma_ <= 0.0)
+        {
+            return true;
+        }
+
+        const M3D innovation_covariance = dvl.H * P * dvl.H.transpose() + dvl.R;
+        Eigen::LDLT<M3D> ldlt(innovation_covariance);
+        if (ldlt.info() != Eigen::Success)
+        {
+            return false;
+        }
+        const double nis = dvl.residual.dot(ldlt.solve(dvl.residual));
+        const double threshold = 3.0 * dvl_innovation_gate_sigma_ *
+                                 dvl_innovation_gate_sigma_;
+        return std::isfinite(nis) && nis <= threshold;
+    }
+
+    Eigen::RowVector3d world_z_axis_in_camera_init() const
+    {
+        return camera_init_R_in_world_.row(2);
+    }
+
+    double pressure_sensor_z_world(const state_ikfom &state) const
+    {
+        V3D pressure_offset_ci = V3D::Zero();
+        pressure_offset_ci.z() = pressure_T_.z();
+        const V3D sensor_ci = state.pos + pressure_offset_ci;
+        return camera_init_T_in_world_.z() + world_z_axis_in_camera_init().dot(sensor_ci);
     }
 
     double pressure_raw_depth(const state_ikfom &state) const
     {
-        // state.pos is in camera_init coordinates. pressure_surface_z_ is the
-        // water-surface z in WORLD coordinates, so subtract camera_init's world
-        // z to express the surface in camera_init.
-        const double surface_z_ci = pressure_surface_z_ - camera_init_z_in_world_;
-        return surface_z_ci - pressure_sensor_z_ci(state);
+        return pressure_surface_z_ - pressure_sensor_z_world(state);
     }
 
     double pressure_prediction(const state_ikfom &state) const
     {
-        const double relative_depth = pressure_reference_sensor_z_ci_ - pressure_sensor_z_ci(state);
+        const double relative_depth = pressure_reference_sensor_z_world_ - pressure_sensor_z_world(state);
         return pressure_surface_pressure_ + pressure_scale() * relative_depth + state.b_pressure[0];
     }
 
@@ -687,49 +1056,32 @@ private:
 
         const double mean_pressure =
             pressure_init_sum_ / static_cast<double>(pressure_init_samples_collected_);
-        pressure_reference_sensor_z_ci_ = pressure_sensor_z_ci(state);
+        pressure_reference_sensor_z_world_ = pressure_sensor_z_world(state);
         pressure_surface_pressure_ = mean_pressure - state.b_pressure[0];
         pressure_ref_finalized_ = true;
         return true;
     }
 
-    bool apply_dvl_update(const DvlMsg &msg, const V3D &omega_body, Ekf &kf, bool allow_attitude_update)
+    bool apply_dvl_update(const DvlMsg &msg,
+                          const ImuAngularSample &imu_sample,
+                          Ekf &kf)
     {
+        // Until the startup-relative magnetic heading is initialized, yaw is
+        // unobservable in a stand-alone body-frame velocity update. Deferring
+        // these first few DVL samples prevents an arbitrary startup yaw while
+        // retaining the complete DVL Jacobian and gain thereafter.
+        if (mag_enable_ && !mag_reference_is_ready())
+        {
+            return false;
+        }
         const state_ikfom state = kf.get_x();
-        const V3D residual = dvl_residual(msg, state, omega_body);
-
-        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, state_ikfom::DOF);
-
-        const M3D R_wb = state.rot.toRotationMatrix();
-        const V3D vel_body = R_wb.transpose() * V3D(state.vel[0], state.vel[1], state.vel[2]);
-        H.block<3, 3>(0, 12) = dvl_R_.transpose() * R_wb.transpose();
-        // Residual is measured_dvl - predicted_dvl. Controlled sim tests showed
-        // this negative attitude block is required; the opposite sign excites
-        // turn-induced roll/yaw drift instead of reducing the DVL residual.
-        if (allow_attitude_update)
+        const DvlLinearization dvl =
+            build_dvl_linearization(make_dvl_observation(msg, imu_sample, state), state);
+        if (!dvl_passes_gate(dvl, kf.get_P()))
         {
-            H.block<3, 3>(0, 3) = -dvl_R_.transpose() * skew(vel_body);
+            return false;
         }
-        H.block<3, 3>(0, 15) = dvl_R_.transpose() * skew(dvl_T_);
-        H.block<3, 3>(0, 23) = M3D::Identity();
-
-        Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3, 3);
-        R(0, 0) = covariance_or_fallback(msg.twist.covariance[0], dvl_velocity_cov_);
-        R(1, 1) = covariance_or_fallback(msg.twist.covariance[7], dvl_velocity_cov_);
-        R(2, 2) = covariance_or_fallback(msg.twist.covariance[14], dvl_velocity_cov_);
-
-        if (dvl_innovation_gate_sigma_ > 0.0)
-        {
-            for (int i = 0; i < 3; ++i)
-            {
-                if (std::abs(residual[i]) > dvl_innovation_gate_sigma_ * std::sqrt(R(i, i)))
-                {
-                    return false;
-                }
-            }
-        }
-
-        return apply_linear_update(residual, H, R, kf);
+        return apply_linear_update(dvl.residual, dvl.H, dvl.R, kf);
     }
 
     bool apply_pressure_update(const PressureMsg &msg, Ekf &kf)
@@ -744,12 +1096,9 @@ private:
         residual(0) = pressure_residual(msg, state);
 
         Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, state_ikfom::DOF);
-        H(0, 2) = -pressure_scale();
-        if (pressure_use_attitude_lever_arm_)
-        {
-            H.block<1, 3>(0, 3) = pressure_scale() *
-                                   (Eigen::RowVector3d::UnitZ() * state.rot.toRotationMatrix() * skew(pressure_T_));
-        }
+        // Pressure measures World-z depth, but it must not correct horizontal
+        // x/y. Use the World-z prediction and let the EKF correct only local depth.
+        H(0, 2) = -pressure_scale() * world_z_axis_in_camera_init().z();
         H(0, 26) = 1.0;
 
         Eigen::MatrixXd R = Eigen::MatrixXd::Zero(1, 1);
@@ -770,10 +1119,6 @@ private:
             }
         }
 
-        if (pressure_use_attitude_lever_arm_)
-        {
-            return apply_linear_update(residual, H, R, kf);
-        }
         return apply_pressure_depth_update(residual, H, R, kf);
     }
 
@@ -815,17 +1160,59 @@ private:
         typename Ekf::vectorized_state dx = Ekf::vectorized_state::Zero();
         dx = dx_dyn;
 
-        state_ikfom state = kf.get_x();
-        state.boxplus(dx);
+        state_ikfom updated_state = kf.get_x();
+        updated_state.boxplus(dx);
 
         const typename Ekf::cov I_state = Ekf::cov::Identity();
         typename Ekf::cov KH = K * H;
         typename Ekf::cov P_new = (I_state - KH) * P * (I_state - KH).transpose() + K * R * K.transpose();
         P_new = 0.5 * (P_new + P_new.transpose()).eval();
 
-        kf.change_x(state);
+        kf.change_x(updated_state);
         kf.change_P(P_new);
         return true;
+    }
+
+    typename Ekf::cov transport_covariance_after_boxplus(
+        const typename Ekf::cov &P,
+        state_ikfom prior_state,
+        state_ikfom updated_state,
+        const typename Ekf::vectorized_state &dx) const
+    {
+        if (prior_state.SO3_state.empty() || prior_state.S2_state.empty())
+        {
+            prior_state.build_SO3_state();
+            prior_state.build_S2_state();
+        }
+        if (updated_state.SO3_state.empty() || updated_state.S2_state.empty())
+        {
+            updated_state.build_SO3_state();
+            updated_state.build_S2_state();
+        }
+
+        typename Ekf::cov transport = Ekf::cov::Identity();
+        for (const auto &entry : updated_state.SO3_state)
+        {
+            const int index = entry.first;
+            MTK::vect<3, double> segment;
+            segment << dx(index), dx(index + 1), dx(index + 2);
+            transport.template block<3, 3>(index, index) =
+                MTK::A_matrix(segment).transpose();
+        }
+        for (const auto &entry : updated_state.S2_state)
+        {
+            const int index = entry.first;
+            MTK::vect<2, double> segment;
+            segment << dx(index), dx(index + 1);
+            Eigen::Matrix<double, 2, 3> Nx;
+            Eigen::Matrix<double, 3, 2> Mx;
+            updated_state.S2_Nx_yy(Nx, index);
+            prior_state.S2_Mx(Mx, segment, index);
+            transport.template block<2, 2>(index, index) = Nx * Mx;
+        }
+
+        typename Ekf::cov transported = transport * P * transport.transpose();
+        return 0.5 * (transported + transported.transpose()).eval();
     }
 
     bool apply_linear_update(const Eigen::VectorXd &residual,
@@ -849,7 +1236,7 @@ private:
         }
 
         const Eigen::MatrixXd I_meas = Eigen::MatrixXd::Identity(residual.size(), residual.size());
-        const Eigen::MatrixXd K = P * H.transpose() * ldlt.solve(I_meas);
+        Eigen::MatrixXd K = P * H.transpose() * ldlt.solve(I_meas);
         const Eigen::VectorXd dx_dyn = K * residual;
         if (!finite_vector(dx_dyn))
         {
@@ -859,15 +1246,17 @@ private:
         typename Ekf::vectorized_state dx = Ekf::vectorized_state::Zero();
         dx = dx_dyn;
 
-        state_ikfom state = kf.get_x();
-        state.boxplus(dx);
+        const state_ikfom prior_state = kf.get_x();
+        state_ikfom updated_state = prior_state;
+        updated_state.boxplus(dx);
 
         const typename Ekf::cov I_state = Ekf::cov::Identity();
         typename Ekf::cov KH = K * H;
         typename Ekf::cov P_new = (I_state - KH) * P * (I_state - KH).transpose() + K * R * K.transpose();
         P_new = 0.5 * (P_new + P_new.transpose()).eval();
+        P_new = transport_covariance_after_boxplus(P_new, prior_state, updated_state, dx);
 
-        kf.change_x(state);
+        kf.change_x(updated_state);
         kf.change_P(P_new);
         return true;
     }
@@ -955,28 +1344,126 @@ private:
         if (timestamp < last_timestamp_mag_)
         {
             mag_buffer_.clear();
+            reset_mag_reference_locked();
         }
         last_timestamp_mag_ = timestamp;
         mag_buffer_.push_back(msg);
     }
 
-    // Apply offline hard-iron/soft-iron calibration and return corrected body-frame field.
+    // R_BM rotates the calibrated magnetometer-frame field into the IMU/body frame.
     V3D mag_corrected(const MagMsg &msg) const
     {
         const V3D raw(msg.magnetic_field.x, msg.magnetic_field.y, msg.magnetic_field.z);
-        return mag_soft_iron_ * (raw - mag_hard_iron_);
+        return mag_R_BM_ * mag_soft_iron_ * (raw - mag_hard_iron_);
     }
 
-    // h(state) = R_ci_body^T * B_ci + b_mag
-    V3D mag_prediction(const state_ikfom &state) const
+    M3D mag_calibrated_covariance() const
     {
-        return state.rot.toRotationMatrix().transpose() * mag_earth_field_world_ +
-               V3D(state.b_mag[0], state.b_mag[1], state.b_mag[2]);
+        const M3D calibration = mag_R_BM_ * mag_soft_iron_;
+        return mag_cov_ * calibration * calibration.transpose();
     }
 
-    V3D mag_residual(const MagMsg &msg, const state_ikfom &state) const
+    void reset_mag_reference_locked()
     {
-        return mag_corrected(msg) - mag_prediction(state);
+        mag_reference_sum_local_.setZero();
+        mag_reference_samples_local_.clear();
+        mag_reference_sample_count_ = 0;
+        mag_reference_ready_ = false;
+        mag_vertical_local_ = V3D::UnitZ();
+        mag_reference_local_.setZero();
+        mag_horizontal_reference_local_.setZero();
+        mag_reference_heading_variance_ = 0.0;
+    }
+
+    bool mag_reference_is_ready() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return mag_reference_ready_;
+    }
+
+    bool collect_mag_reference_sample(const state_ikfom &state,
+                                      const V3D &magnetic_body,
+                                      const char *&reason)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (mag_reference_ready_)
+        {
+            return true;
+        }
+
+        if (mag_reference_sample_count_ == 0)
+        {
+            const V3D gravity_local(state.grav[0], state.grav[1], state.grav[2]);
+            mag_vertical_local_ = V3D::UnitZ();
+            if (gravity_local.norm() > 1e-6)
+            {
+                mag_vertical_local_ = (-gravity_local).normalized();
+            }
+        }
+
+        if (!magnetic_body.allFinite() || magnetic_body.norm() <= 1e-12)
+        {
+            reason = "invalid_sample";
+            return false;
+        }
+
+        const V3D sample_local = state.rot.toRotationMatrix() * magnetic_body;
+        V3D running_mean = V3D::Zero();
+        if (mag_reference_sample_count_ > 0)
+        {
+            running_mean =
+                mag_reference_sum_local_ / static_cast<double>(mag_reference_sample_count_);
+        }
+        if (!underwater_fastlio::magnetometer::reference_sample_is_inlier(
+                sample_local, running_mean, mag_reference_sample_count_))
+        {
+            reason = "reference_outlier";
+            return false;
+        }
+
+        mag_reference_sum_local_ += sample_local;
+        mag_reference_samples_local_.push_back(sample_local);
+        ++mag_reference_sample_count_;
+        if (mag_reference_sample_count_ < kMagReferenceSamples)
+        {
+            reason = "reference_initializing";
+            return false;
+        }
+
+        mag_reference_local_ =
+            mag_reference_sum_local_ / static_cast<double>(mag_reference_sample_count_);
+        const V3D n = mag_vertical_local_;
+        const V3D horizontal =
+            mag_reference_local_ - n * n.dot(mag_reference_local_);
+        if (mag_reference_local_.norm() <= 1e-12 || horizontal.norm() <= 1e-12)
+        {
+            reset_mag_reference_locked();
+            reason = "reference_horizontal_field_too_small";
+            return false;
+        }
+
+        mag_horizontal_reference_local_ = horizontal.normalized();
+        double heading_sq_sum = 0.0;
+        for (const V3D &sample : mag_reference_samples_local_)
+        {
+            V3D sample_horizontal = sample - n * n.dot(sample);
+            if (sample_horizontal.norm() <= 1e-12)
+            {
+                continue;
+            }
+            sample_horizontal.normalize();
+            const double angle = std::atan2(
+                n.dot(mag_horizontal_reference_local_.cross(sample_horizontal)),
+                mag_horizontal_reference_local_.dot(sample_horizontal));
+            heading_sq_sum += angle * angle;
+        }
+        mag_reference_heading_variance_ =
+            heading_sq_sum /
+            (static_cast<double>(mag_reference_sample_count_) *
+             static_cast<double>(mag_reference_sample_count_));
+        mag_reference_ready_ = true;
+        reason = "reference_ready";
+        return false;
     }
 
     std::vector<MagMsg::ConstSharedPtr> take_mag_measurements(double begin_time, double end_time)
@@ -999,41 +1486,237 @@ private:
         return messages;
     }
 
-    bool apply_mag_update(const MagMsg &msg, Ekf &kf)
+    bool apply_mag_update(const MagMsg &msg,
+                          Ekf &kf,
+                          double *innovation_out = nullptr,
+                          bool allow_state_update = true)
     {
-        const state_ikfom state = kf.get_x();
-        const V3D residual = mag_residual(msg, state);
-
-        // b_mag is at DOF 27-29
-        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, state_ikfom::DOF);
-        const V3D B_body_pred = state.rot.toRotationMatrix().transpose() * mag_earth_field_world_;
-        H.block<3, 3>(0, 3)  = skew(B_body_pred);  // ∂h/∂rot
-        H.block<3, 3>(0, 27) = M3D::Identity();     // ∂h/∂b_mag
-
-        Eigen::MatrixXd R = Eigen::MatrixXd::Identity(3, 3) * mag_cov_;
-
-        // Innovation covariance: use S = H*P*H^T + R for a proper gate.
-        // This lets large residuals through when state uncertainty is large (e.g.,
-        // during b_mag init) and tightens automatically as covariance collapses.
-        if (mag_innovation_gate_sigma_ > 0.0)
+        if (innovation_out)
         {
-            const typename Ekf::cov &P_state = kf.get_P();
-            const Eigen::MatrixXd S_innov = H * P_state * H.transpose() + R;
-            for (int i = 0; i < 3; ++i)
-            {
-                const double innov_sigma = std::sqrt(S_innov(i, i));
-                if (std::abs(residual[i]) > mag_innovation_gate_sigma_ * innov_sigma)
-                    return false;
-            }
+            *innovation_out = 0.0;
         }
 
-        return apply_linear_update(residual, H, R, kf);
+        const state_ikfom state = kf.get_x();
+        const V3D measured = mag_corrected(msg);
+        const double yaw_before = yaw_from_state(state);
+
+        const char *reference_reason = "reference_initializing";
+        if (!collect_mag_reference_sample(state, measured, reference_reason))
+        {
+            write_mag_debug_row(msg, measured, {}, 0.0, 0.0, 0.0,
+                                V3D::Zero(), V3D::Zero(), V3D::Zero(),
+                                false, reference_reason, yaw_before, yaw_before,
+                                0.0, 0.0, 0.0);
+            return false;
+        }
+        if (!allow_state_update)
+        {
+            return false;
+        }
+
+        V3D h0;
+        V3D vertical_local;
+        double reference_variance = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            h0 = mag_horizontal_reference_local_;
+            vertical_local = mag_vertical_local_;
+            reference_variance = mag_reference_heading_variance_;
+        }
+
+        const auto observation = underwater_fastlio::magnetometer::evaluate(
+            state.rot.toRotationMatrix(), measured, h0, vertical_local);
+        if (!observation.valid)
+        {
+            write_mag_debug_row(msg, measured, observation, 0.0, 0.0, 0.0,
+                                V3D::Zero(), V3D::Zero(), V3D::Zero(),
+                                false, "heading_geometry_degenerate", yaw_before, yaw_before,
+                                0.0, 0.0, 0.0);
+            return false;
+        }
+        if (innovation_out)
+        {
+            *innovation_out = observation.innovation;
+        }
+
+        const M3D calibrated_covariance = mag_calibrated_covariance();
+        double heading_covariance =
+            (observation.magnetic_jacobian * calibrated_covariance *
+             observation.magnetic_jacobian.transpose())(0, 0) +
+            mag_heading_cov_floor_ + reference_variance;
+        heading_covariance = std::max(1e-12, heading_covariance);
+
+        Eigen::RowVectorXd H = Eigen::RowVectorXd::Zero(state_ikfom::DOF);
+        H.segment<3>(3) = observation.observation_jacobian;
+        typename Ekf::cov P = kf.get_P();
+        const double innovation_variance = (H * P * H.transpose())(0, 0) + heading_covariance;
+        if (!H.allFinite() || !P.allFinite() || !std::isfinite(innovation_variance) ||
+            innovation_variance <= 0.0)
+        {
+            write_mag_debug_row(msg, measured, observation, heading_covariance,
+                                innovation_variance, 0.0, V3D::Zero(), V3D::Zero(), V3D::Zero(),
+                                false, "invalid_innovation_covariance", yaw_before, yaw_before,
+                                0.0, 0.0, 0.0);
+            return false;
+        }
+
+        const double nis = observation.innovation * observation.innovation /
+                           innovation_variance;
+        if (mag_innovation_gate_sigma_ > 0.0 &&
+            nis > mag_innovation_gate_sigma_ * mag_innovation_gate_sigma_)
+        {
+            write_mag_debug_row(msg, measured, observation, heading_covariance,
+                                innovation_variance, nis, V3D::Zero(), V3D::Zero(), V3D::Zero(),
+                                false, "innovation_nis", yaw_before, yaw_before,
+                                0.0, 0.0, 0.0);
+            return false;
+        }
+
+        const Eigen::VectorXd K = underwater_fastlio::magnetometer::constrained_gain(
+            P, H, innovation_variance, observation.g, 3);
+        const Eigen::VectorXd dx_dyn = K * observation.innovation;
+        if (!finite_vector(dx_dyn))
+        {
+            write_mag_debug_row(msg, measured, observation, heading_covariance,
+                                innovation_variance, nis, K.segment<3>(3), K.segment<3>(15),
+                                V3D::Zero(), false, "nonfinite_dx", yaw_before, yaw_before,
+                                0.0, 0.0, 0.0);
+            return false;
+        }
+
+        typename Ekf::vectorized_state dx = Ekf::vectorized_state::Zero();
+        dx = dx_dyn;
+        state_ikfom updated_state = state;
+        updated_state.boxplus(dx);
+
+        const V3D g_after =
+            updated_state.rot.toRotationMatrix().transpose() * vertical_local;
+        const double tilt_axis_change = (g_after - observation.g).norm();
+        Eigen::VectorXd protected_dx = dx_dyn;
+        protected_dx.segment<3>(3).setZero();
+        protected_dx.segment<3>(15).setZero();
+        const double protected_state_change = protected_dx.cwiseAbs().maxCoeff();
+        if (tilt_axis_change > 1e-10 || protected_state_change > 1e-14)
+        {
+            write_mag_debug_row(msg, measured, observation, heading_covariance,
+                                innovation_variance, nis, K.segment<3>(3), K.segment<3>(15),
+                                dx_dyn.segment<3>(3), false, "roll_pitch_protection_failed",
+                                yaw_before, yaw_before, tilt_axis_change,
+                                protected_state_change, 0.0);
+            return false;
+        }
+
+        Eigen::MatrixXd P_new = underwater_fastlio::magnetometer::joseph_covariance(
+            P, H, K, heading_covariance);
+        P_new = underwater_fastlio::magnetometer::transport_attitude_covariance(
+            P_new, dx_dyn.segment<3>(3), 3);
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> covariance_solver(P_new);
+        const double min_eigenvalue = covariance_solver.info() == Eigen::Success
+            ? covariance_solver.eigenvalues().minCoeff()
+            : -std::numeric_limits<double>::infinity();
+        if (!underwater_fastlio::magnetometer::covariance_is_psd(P_new, 1e-9))
+        {
+            write_mag_debug_row(msg, measured, observation, heading_covariance,
+                                innovation_variance, nis, K.segment<3>(3), K.segment<3>(15),
+                                dx_dyn.segment<3>(3), false, "covariance_not_psd",
+                                yaw_before, yaw_before, tilt_axis_change,
+                                protected_state_change, min_eigenvalue);
+            return false;
+        }
+
+        const auto after_observation = underwater_fastlio::magnetometer::evaluate(
+            updated_state.rot.toRotationMatrix(), measured, h0, vertical_local);
+        const double yaw_after = yaw_from_state(updated_state);
+        kf.change_x(updated_state);
+        typename Ekf::cov fixed_P = P_new;
+        kf.change_P(fixed_P);
+        write_mag_debug_row(msg, measured, observation, heading_covariance,
+                            innovation_variance, nis, K.segment<3>(3), K.segment<3>(15),
+                            dx_dyn.segment<3>(3), true, "accepted", yaw_before, yaw_after,
+                            tilt_axis_change, protected_state_change, min_eigenvalue,
+                            after_observation.valid ? after_observation.innovation : 0.0);
+        return true;
+    }
+
+    double yaw_from_state(const state_ikfom &state) const
+    {
+        const M3D R = state.rot.toRotationMatrix();
+        return std::atan2(R(1, 0), R(0, 0));
+    }
+
+    void write_mag_debug_row(const MagMsg &msg,
+                             const V3D &measured,
+                             const underwater_fastlio::magnetometer::HeadingObservation &observation,
+                             double heading_covariance,
+                             double innovation_cov,
+                             double nis,
+                             const V3D &attitude_gain,
+                             const V3D &gyro_bias_gain,
+                             const V3D &attitude_correction,
+                             bool accepted,
+                             const char *reason,
+                             double yaw_before,
+                             double yaw_after,
+                             double tilt_axis_change,
+                             double protected_state_change,
+                             double min_covariance_eigenvalue,
+                             double innovation_after = 0.0)
+    {
+        if (mag_debug_csv_path_.empty())
+        {
+            return;
+        }
+        if (!mag_debug_csv_.is_open())
+        {
+            mag_debug_csv_.open(mag_debug_csv_path_, std::ios::out | std::ios::trunc);
+            if (!mag_debug_csv_.is_open())
+            {
+                mag_debug_csv_path_.clear();
+                return;
+            }
+            mag_debug_csv_ << "stamp,accepted,reason,innovation_rad,innovation_after_rad,heading_cov,S,nis,"
+                              "yaw_before_rad,yaw_after_rad,tilt_axis_change,protected_state_change,min_cov_eig,"
+                              "meas_x,meas_y,meas_z,g_x,g_y,g_z,p_x,p_y,p_z,"
+                              "k_theta_x,k_theta_y,k_theta_z,k_bg_x,k_bg_y,k_bg_z,"
+                              "dx_theta_x,dx_theta_y,dx_theta_z\n";
+        }
+        mag_debug_csv_ << std::setprecision(12)
+                       << get_time_sec(msg.header.stamp) << ','
+                       << (accepted ? 1 : 0) << ','
+                       << reason << ','
+                       << observation.innovation << ','
+                       << innovation_after << ','
+                       << heading_covariance << ','
+                       << innovation_cov << ','
+                       << nis << ','
+                       << yaw_before << ','
+                       << yaw_after << ','
+                       << tilt_axis_change << ','
+                       << protected_state_change << ','
+                       << min_covariance_eigenvalue << ','
+                       << measured.x() << ','
+                       << measured.y() << ','
+                       << measured.z() << ','
+                       << observation.g.x() << ','
+                       << observation.g.y() << ','
+                       << observation.g.z() << ','
+                       << observation.p.x() << ','
+                       << observation.p.y() << ','
+                       << observation.p.z() << ','
+                       << attitude_gain.x() << ','
+                       << attitude_gain.y() << ','
+                       << attitude_gain.z() << ','
+                       << gyro_bias_gain.x() << ','
+                       << gyro_bias_gain.y() << ','
+                       << gyro_bias_gain.z() << ','
+                       << attitude_correction.x() << ','
+                       << attitude_correction.y() << ','
+                       << attitude_correction.z() << '\n';
     }
 
     bool dvl_enable_ = false;
     bool pressure_enable_ = false;
     bool mag_enable_ = false;
-    bool pressure_before_dvl_ = false;
     std::string dvl_topic_ = "/auv/dvl";
     std::string pressure_topic_ = "/auv/pressure/scaled2";
     std::string mag_topic_ = "/auv/imu/magnetic_field";
@@ -1043,31 +1726,40 @@ private:
     double dvl_velocity_cov_ = 4e-4;
     double dvl_innovation_gate_sigma_ = 5.0;
     double dvl_b_init_cov_ = 1e-8;
-    bool dvl_attitude_update_en_ = true;
     double pressure_cov_ = 1e4;
     double pressure_innovation_gate_sigma_ = 0.0;
-    double camera_init_z_in_world_ = 0.0;
+    V3D camera_init_T_in_world_ = V3D::Zero();
+    M3D camera_init_R_in_world_ = M3D::Identity();
     double pressure_fluid_density_ = 1025.0;
     double pressure_gravity_ = 9.80665;
     double pressure_surface_pressure_ = 101325.0;
     double pressure_surface_z_ = 0.0;
-    bool pressure_use_attitude_lever_arm_ = false;
-    double pressure_reference_sensor_z_ci_ = 0.0;
+    double pressure_reference_sensor_z_world_ = 0.0;
     static constexpr int kPressureReferenceSamples = 20;
     double pressure_init_sum_ = 0.0;
     int pressure_init_samples_collected_ = 0;
     bool pressure_ref_finalized_ = false;
     double mag_cov_ = 1849.0;
-    double mag_b_init_cov_ = 1e6;
-    double mag_b_proc_cov_ = 0.001;
+    double mag_heading_cov_floor_ = 1e-6;
     double mag_innovation_gate_sigma_ = 3.0;
+    static constexpr int kMagReferenceSamples = 20;
+    V3D mag_reference_sum_local_ = V3D::Zero();
+    std::vector<V3D> mag_reference_samples_local_;
+    int mag_reference_sample_count_ = 0;
+    bool mag_reference_ready_ = false;
+    // Fixed when reference collection starts; magnetometer updates rotate only about this axis.
+    V3D mag_vertical_local_ = V3D::UnitZ();
+    V3D mag_reference_local_ = V3D::Zero();
+    V3D mag_horizontal_reference_local_ = V3D::Zero();
+    double mag_reference_heading_variance_ = 0.0;
     V3D dvl_T_ = V3D::Zero();
     M3D dvl_R_ = M3D::Identity();
     V3D pressure_T_ = V3D::Zero();
-    V3D mag_earth_field_imu_   = V3D::Zero();  // loaded from config (body frame at init)
-    V3D mag_earth_field_world_ = V3D::Zero();  // set by apply_initial_rotation()
+    M3D mag_R_BM_ = M3D::Identity();
     V3D mag_hard_iron_ = V3D::Zero();
     M3D mag_soft_iron_ = M3D::Identity();
+    std::string mag_debug_csv_path_;
+    std::ofstream mag_debug_csv_;
 
     mutable std::mutex mutex_;
     std::deque<DvlMsg::ConstSharedPtr> dvl_buffer_;

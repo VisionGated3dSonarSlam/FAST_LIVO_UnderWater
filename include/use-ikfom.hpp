@@ -20,7 +20,6 @@ MTK_BUILD_MANIFOLD(state_ikfom,
 ((S2, grav))
 ((vect3, b_dvl))
 ((vect1, b_pressure))
-((vect3, b_mag))
 );
 
 MTK_BUILD_MANIFOLD(input_ikfom,
@@ -33,8 +32,12 @@ MTK_BUILD_MANIFOLD(process_noise_ikfom,
 ((vect3, na))
 ((vect3, nbg))
 ((vect3, nba))
-((vect3, nb_mag))
 );
+
+static_assert(state_ikfom::DOF == 27,
+              "Underwater state must contain FAST-LIO2, DVL bias, and pressure bias only.");
+static_assert(process_noise_ikfom::DOF == 12,
+              "Process noise must contain IMU and IMU-bias noise only.");
 
 MTK::get_cov<process_noise_ikfom>::type process_noise_cov()
 {
@@ -43,7 +46,6 @@ MTK::get_cov<process_noise_ikfom>::type process_noise_cov()
 	MTK::setDiagonal<process_noise_ikfom, vect3, 3>(cov, &process_noise_ikfom::na, 0.0001);
 	MTK::setDiagonal<process_noise_ikfom, vect3, 6>(cov, &process_noise_ikfom::nbg, 0.00001);
 	MTK::setDiagonal<process_noise_ikfom, vect3, 9>(cov, &process_noise_ikfom::nba, 0.00001);
-	MTK::setDiagonal<process_noise_ikfom, vect3, 12>(cov, &process_noise_ikfom::nb_mag, 0.001);
 	return cov;
 }
 
@@ -81,14 +83,14 @@ Eigen::Matrix<double, state_ikfom::DIM, state_ikfom::DOF> df_dx(state_ikfom &s, 
 }
 
 
-Eigen::Matrix<double, state_ikfom::DIM, 15> df_dw(state_ikfom &s, const input_ikfom &in)
+Eigen::Matrix<double, state_ikfom::DIM, process_noise_ikfom::DOF> df_dw(state_ikfom &s, const input_ikfom &in)
 {
-	Eigen::Matrix<double, state_ikfom::DIM, 15> cov = Eigen::Matrix<double, state_ikfom::DIM, 15>::Zero();
+	Eigen::Matrix<double, state_ikfom::DIM, process_noise_ikfom::DOF> cov =
+		Eigen::Matrix<double, state_ikfom::DIM, process_noise_ikfom::DOF>::Zero();
 	cov.template block<3, 3>(12, 3) = -s.rot.toRotationMatrix();
 	cov.template block<3, 3>(3, 0) = -Eigen::Matrix3d::Identity();
 	cov.template block<3, 3>(15, 6) = Eigen::Matrix3d::Identity();
 	cov.template block<3, 3>(18, 9) = Eigen::Matrix3d::Identity();
-	cov.template block<3, 3>(27, 12) = Eigen::Matrix3d::Identity();
 	return cov;
 }
 

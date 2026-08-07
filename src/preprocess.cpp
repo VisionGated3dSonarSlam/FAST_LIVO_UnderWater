@@ -7,7 +7,7 @@
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
-Preprocess::Preprocess() : feature_enabled(0), lidar_type(XYZI), blind(0.01), point_filter_num(1)
+Preprocess::Preprocess() : feature_enabled(0), lidar_type(XYZI), point_filter_num(1), blind(0.01)
 {
   inf_bound = 10;
   N_SCANS = 6;
@@ -534,7 +534,8 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
       added_pt.intensity = intensity_missing ? fallback_intensity : read_field_as_float(point_ptr, intensity_field);
       added_pt.curvature = 0.;
 
-      if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+      const double range2 = added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z;
+      if (range2 > (blind * blind))
       {
         pl_surf.push_back(std::move(added_pt));
       }

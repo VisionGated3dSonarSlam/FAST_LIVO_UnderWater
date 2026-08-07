@@ -1638,10 +1638,11 @@ public:
 			#ifdef USE_sparse
 				spMt h_x_ = dyn_share.h_x.sparseView();
 			#else
-				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_ = dyn_share.h_x;
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_ = dyn_share.h_x;
 			#endif
 			double solve_start = omp_get_wtime();
 			dof_Measurement = h_x_.rows();
+			const bool original_lidar_layout = h_x_.cols() == 12;
 			vectorized_state dx;
 			x_.boxminus(dx, x_propagated);
 			dx_new = dx;
@@ -1696,6 +1697,18 @@ public:
 			//Matrix<scalar_type, n, n> K_x; 
 
 			/*
+			Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur =
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
+			if (h_x_.cols() == n)
+			{
+				h_x_cur = h_x_;
+			}
+			else
+			{
+				h_x_cur.topLeftCorner(dof_Measurement, std::min<int>(h_x_.cols(), n)) =
+					h_x_.leftCols(std::min<int>(h_x_.cols(), n));
+			}
+
 			if(n > dof_Measurement)
 			{
 				K_= P_ * h_x_.transpose() * (h_x_ * P_ * h_x_.transpose()/R + Eigen::Matrix<double, Dynamic, Dynamic>::Identity(dof_Measurement, dof_Measurement)).inverse()/R;
@@ -1706,14 +1719,24 @@ public:
 			}
 			*/
 
+			Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur =
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
+			if (h_x_.cols() == n)
+			{
+				h_x_cur = h_x_;
+			}
+			else
+			{
+				const int cols = std::min<int>(h_x_.cols(), n);
+				h_x_cur.topLeftCorner(dof_Measurement, cols) = h_x_.leftCols(cols);
+			}
+
 			if(n > dof_Measurement)
 			{
 			//#ifdef USE_sparse
 				//Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> K_temp = h_x * P_ * h_x.transpose();
 				//spMt R_temp = h_v * R_ * h_v.transpose();
 				//K_temp += R_temp;
-				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
-				h_x_cur.topLeftCorner(dof_Measurement, 12) = h_x_;
 				/*
 				h_x_cur.col(0) = h_x_.col(0);
 				h_x_cur.col(1) = h_x_.col(1);
@@ -1774,9 +1797,23 @@ public:
 				*/
 			#else
 				cov P_temp = (P_/R).inverse();
-				//Eigen::Matrix<scalar_type, 12, Eigen::Dynamic> h_T = h_x_.transpose();
-				Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_.transpose() * h_x_; 
-				P_temp. template block<12, 12>(0, 0) += HTH;
+				if (original_lidar_layout)
+				{
+					// This is the original FAST-LIO2 information-form path.
+					// Keep it unchanged when no auxiliary residual is stacked.
+					Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_.transpose() * h_x_;
+					P_temp.template block<12, 12>(0, 0) += HTH;
+					cov P_inv = P_temp.inverse();
+					K_h = P_inv.template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
+					K_x.setZero();
+					K_x.template block<n, 12>(0, 0) =
+						P_inv.template block<n, 12>(0, 0) * HTH;
+				}
+				else
+				{
+					Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HTH =
+						h_x_cur.transpose() * h_x_cur;
+					P_temp += HTH;
 				/*
 				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
 				h_x_cur.col(0) = h_x_.col(0);
@@ -1792,12 +1829,13 @@ public:
 				h_x_cur.col(10) = h_x_.col(10);
 				h_x_cur.col(11) = h_x_.col(11);
 				*/
-				cov P_inv = P_temp.inverse();
-				K_h = P_inv. template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
+					cov P_inv = P_temp.inverse();
+					K_h = P_inv * h_x_cur.transpose() * dyn_share.h;
 				//cov HTH_cur = cov::Zero();
 				//HTH_cur. template block<12, 12>(0, 0) = HTH;
-				K_x.setZero(); // = cov::Zero();
-				K_x. template block<n, 12>(0, 0) = P_inv. template block<n, 12>(0, 0) * HTH;
+					K_x.setZero(); // = cov::Zero();
+					K_x = P_inv * HTH;
+				}
 				//K_= (h_x_.transpose() * h_x_ + (P_/R).inverse()).inverse()*h_x_.transpose();
 			#endif 
 			}
@@ -1844,7 +1882,8 @@ public:
 					// }
 					// else
 					// {
-						for(int i = 0; i < 12; i++){
+						const int gain_cols = original_lidar_layout ? 12 : n;
+						for(int i = 0; i < gain_cols; i++){
 							K_x. template block<3, 1>(idx, i) = res_temp_SO3 * (K_x. template block<3, 1>(idx, i));
 						}
 					//}
@@ -1879,7 +1918,8 @@ public:
 					// }
 					// else
 					// {
-						for(int i = 0; i < 12; i++){
+						const int gain_cols = original_lidar_layout ? 12 : n;
+						for(int i = 0; i < gain_cols; i++){
 							K_x. template block<2, 1>(idx, i) = res_temp_S2 * (K_x. template block<2, 1>(idx, i));
 						}
 					//}
@@ -1911,7 +1951,16 @@ public:
 				// }
 				// else
 				//{
-					P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
+					if (original_lidar_layout)
+					{
+						P_ = L_ - K_x.template block<n, 12>(0, 0) *
+							P_.template block<12, n>(0, 0);
+					}
+					else
+					{
+						P_ = L_ - K_x * P_;
+						P_ = ((P_ + P_.transpose()) * 0.5).eval();
+					}
 				//}
 				solve_time += omp_get_wtime() - solve_start;
 				return;

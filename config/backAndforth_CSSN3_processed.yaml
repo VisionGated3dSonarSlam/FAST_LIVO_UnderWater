@@ -1,7 +1,7 @@
 /**:
     ros__parameters:
         # Maximum IEKF scan-to-map correction iterations per LiDAR/sonar frame.
-        max_iteration: 16
+        max_iteration: 4
         # Voxel leaf size in meters for downsampling the current scan before matching.
         filter_size_surf: 0.3
         # Voxel leaf size in meters for downsampling points inserted into the map/ikd-tree.
@@ -10,7 +10,7 @@
         map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/sonar_point_cloud"               
+            lid_topic:  "/sonar_point_cloud"
             imu_topic:  "/auv/imu/data_raw"
             world_frame: "World"
             
@@ -20,6 +20,8 @@
             world_to_camera_init_R: [ 0.469503040, -0.882815819,  0.014252208,
                                     0.882753813,  0.469024500, -0.027599339,
                                     0.017680498,  0.025539164,  0.999517459 ]
+            imu_rate_hz: 200.0
+            lidar_timeout: 0.25
             gravity_m_s2: 9.81
 
         preprocess:
@@ -27,16 +29,24 @@
 
         mapping:
             noiseless_imu: false
+            obs_manager_sonar_timeout: 0.0
+            obs_manager_ramp_time: 0.0
+            obs_manager_freeze_cov: 1.0e-10
+            imu_gyro_scale: [ 1.0, 1.0, 1.0 ]
 
             b_acc_cov: 0.2
             b_gyr_cov: 0.000001
-            # init_b_acc_cov: 0.001
-            # init_b_gyr_cov: 0.0001
-            # init_grav_cov: 0.00001
+            init_b_acc_cov: 0.001
+            init_b_gyr_cov: 0.0001
+            init_grav_cov: 0.00001
 
 
             acc_cov: 0.1
             gyr_cov: 0.000001
+            imu_orientation_cov: 3.0461742e-6
+            imu_orientation_gate_sigma: 0.0
+            accel_attitude_cov: 1.2184697e-3
+            accel_attitude_norm_gate: 2.0
             laser_point_cov_xy: 0.1
             laser_point_cov_z: 0.2
             fov_degree:    90.0
@@ -62,22 +72,26 @@
             enable: true
             topic: "/auv/pressure/scaled2"
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
+            surface_pressure: 101325.0
             pressure_timeout: 0.25
             fluid_density: 1025.0
-            pressure_cov: 1.0e4
+            gravity: 9.80665
+            pressure_cov: 1.0e-4
             innovation_gate_sigma: 0.0
+            surface_z: 0.0
 
         magnetometer:
             enable: true
             topic: "/auv/imu/magnetic_field"
-            earth_field_imu: [ -279.57, 148.45, 513.70 ]
+            extrinsic_R: [ 1.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0,
+                           0.0, 0.0, 1.0 ]
             hard_iron_offset: [ -0.30, -19.96, 86.70 ]
             soft_iron_matrix: [ -1.257623, 0.000000, 0.000000,
                                  0.000000, -1.257623, 0.000000,
                                  0.000000,  0.000000, -1.000000 ]
             mag_cov: 100.0
-            b_mag_init_cov: 1.0e6
-            b_mag_proc_cov: 0.001
+            heading_cov_floor: 1.0e-6
             innovation_gate_sigma: 3.0
             mag_timeout: 0.25
 
@@ -88,5 +102,5 @@
             scan_bodyframe_pub_en: true
 
         pcd_save:
-            pcd_save_en: false
+            pcd_save_en: true
             interval: -1
