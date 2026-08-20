@@ -86,6 +86,51 @@
             dense_publish_en: true
             scan_bodyframe_pub_en: true
 
+        # Monocular visual velocity refinement (thesis Phase 3).
+        #
+        # Disabled by default so this file still describes the sonar-only baseline arm.
+        # Enable per-arm with -p visual.enabled:=true.
+        visual:
+            enabled: false
+            img_topic: "/IsaacSim/uw_camera/processed"
+
+            # Pinhole intrinsics, verified against the simulator's own camera_info and by
+            # reprojection through the colorizer. Derived from the optics in sim_params.json
+            # (mode "fov", f = 2.97 mm, 80 deg horizontal). The stock 272.126 corresponded to
+            # Isaac's default 20.955 mm 35 mm-film aperture and a 148 deg field of view.
+            fx: 1144.0834
+            fy: 1144.0834
+            cx: 960.0
+            cy: 540.0
+            image_width: 1920
+            image_height: 1080
+
+            # camera <- sonar extrinsic, from the calibration package. Agrees with the value
+            # derived from sim_params.json to 0.27 deg / 2.7 cm.
+            extrinsic_R_cam_sonar: [ 0.000600, -1.000000, -0.000800,
+                                     0.255700,  0.000900, -0.966700,
+                                     0.966800,  0.000400,  0.255700 ]
+            extrinsic_T_cam_sonar: [ 0.0184, 0.0882, -0.1324 ]
+
+            max_features: 300
+            feature_quality: 0.01
+            min_feature_distance: 12.0
+            image_scale: 0.5
+            max_fb_error_px: 1.5
+            min_tracked_features: 30
+            min_depth_features: 12
+            max_reprojection_error_px: 3.0
+            max_translation_per_frame_m: 1.0
+            max_image_dt: 0.25
+
+            # position_cov is a per-frame DISPLACEMENT variance; the filter converts it to a
+            # velocity variance as cov/dt^2, so the right value depends on the SONAR RATE of
+            # the bag. On pipe_run1 (13.6 Hz sonar, dt ~73 ms) 2.0e-4 gives sigma_v 0.19 m/s
+            # and was the measured optimum; the same value on a 46 Hz-visual bag is a
+            # different trust level entirely. Tune it as a target sigma_v, not as a constant.
+            position_cov: 0.05
+            innovation_gate_sigma: 3.0
+
         pcd_save:
             pcd_save_en: true
             interval: -1

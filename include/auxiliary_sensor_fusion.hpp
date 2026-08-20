@@ -523,6 +523,20 @@ public:
     bool dvl_enabled() const { return dvl_enable_; }
     bool pressure_enabled() const { return pressure_enable_; }
     bool mag_enabled() const { return mag_enable_; }
+
+    /// Apply an externally-built linear measurement through the SAME Joseph-form update and
+    /// post-boxplus covariance transport the DVL/pressure/magnetometer updates use.
+    ///
+    /// Exposed so a measurement source outside this class (the monocular visual update) can be
+    /// a pure producer of (residual, H, R) rather than duplicating the filter mathematics --
+    /// duplicating it is how the two implementations drift apart.
+    bool apply_external_update(const Eigen::VectorXd &residual,
+                               const Eigen::MatrixXd &H,
+                               const Eigen::MatrixXd &R,
+                               Ekf &kf)
+    {
+        return apply_linear_update(residual, H, R, kf);
+    }
     const std::string &dvl_topic() const { return dvl_topic_; }
     const std::string &pressure_topic() const { return pressure_topic_; }
     const std::string &mag_topic() const { return mag_topic_; }

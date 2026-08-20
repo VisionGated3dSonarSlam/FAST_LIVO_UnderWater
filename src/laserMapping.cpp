@@ -44,6 +44,7 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/version.h>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -64,6 +65,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "auxiliary_sensor_fusion.hpp"
+#include "visual_fusion.hpp"
 #include "observability_manager.hpp"
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
@@ -1106,6 +1108,28 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         aux_fusion_.declare_parameters(*this);
+        this->declare_parameter<bool>("visual.enabled", false);
+        this->declare_parameter<std::string>("visual.img_topic", "/IsaacSim/uw_camera/processed");
+        this->declare_parameter<double>("visual.fx", 1144.0834);
+        this->declare_parameter<double>("visual.fy", 1144.0834);
+        this->declare_parameter<double>("visual.cx", 960.0);
+        this->declare_parameter<double>("visual.cy", 540.0);
+        this->declare_parameter<int>("visual.image_width", 1920);
+        this->declare_parameter<int>("visual.image_height", 1080);
+        this->declare_parameter<std::vector<double>>("visual.extrinsic_R_cam_sonar", std::vector<double>());
+        this->declare_parameter<std::vector<double>>("visual.extrinsic_T_cam_sonar", std::vector<double>());
+        this->declare_parameter<int>("visual.max_features", 300);
+        this->declare_parameter<double>("visual.feature_quality", 0.01);
+        this->declare_parameter<double>("visual.min_feature_distance", 12.0);
+        this->declare_parameter<double>("visual.max_fb_error_px", 1.5);
+        this->declare_parameter<int>("visual.min_tracked_features", 30);
+        this->declare_parameter<int>("visual.min_depth_features", 12);
+        this->declare_parameter<double>("visual.max_reprojection_error_px", 3.0);
+        this->declare_parameter<double>("visual.max_translation_per_frame_m", 1.0);
+        this->declare_parameter<double>("visual.position_cov", 0.05);
+        this->declare_parameter<double>("visual.innovation_gate_sigma", 3.0);
+        this->declare_parameter<double>("visual.image_scale", 0.5);
+        this->declare_parameter<double>("visual.max_image_dt", 0.25);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1180,6 +1204,9 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         aux_fusion_.load_parameters(*this);
+        visual_fusion_.load_parameters(*this);
+        this->get_parameter_or<std::string>("visual.img_topic", visual_img_topic,
+                                            std::string("/IsaacSim/uw_camera/processed"));
         auxiliary_fusion_enabled = aux_fusion_.dvl_enabled() ||
                                    aux_fusion_.pressure_enabled() ||
                                    aux_fusion_.mag_enabled();
@@ -1277,13 +1304,35 @@ public:
         else
         {
             auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(200000));
+#if RCLCPP_VERSION_MAJOR >= 21
             lidar_qos.reliability_best_available();
+#else
+            // BEST_AVAILABLE reliability arrived in rclcpp 21 (Iron); Humble ships 16. It
+            // resolves to RELIABLE when every discovered publisher is reliable, which both of
+            // our sources are (the Isaac Sim bridge and `ros2 bag play`), so pin RELIABLE
+            // rather than dropping to BEST_EFFORT, which would silently discard point-cloud
+            // fragments under load.
+            lidar_qos.reliable();
+#endif
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                 lid_topic, lidar_qos, standard_pcl_cbk, lidar_options);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::QoS(rclcpp::KeepLast(200000)), imu_cbk, sensor_options);
         aux_fusion_.create_subscriptions(*this, sensor_callback_group_);
+
+        // Subscribe to the camera ONLY when visual fusion is enabled, so the sonar-only arm
+        // of the evaluation carries no camera dependency whatsoever.
+        if (visual_fusion_.enabled())
+        {
+            auto image_cbk = [this](const sensor_msgs::msg::Image::SharedPtr msg) {
+                visual_fusion_.push_image(*msg);
+            };
+            sub_image_ = this->create_subscription<sensor_msgs::msg::Image>(
+                visual_img_topic, rclcpp::SensorDataQoS(), image_cbk, sensor_options);
+            RCLCPP_INFO(this->get_logger(), "Visual fusion subscribing to '%s'",
+                        visual_img_topic.c_str());
+        }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -1539,6 +1588,36 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+            // --- monocular visual velocity update ---------------------------------------
+            // Applied after IMU propagation and BEFORE the sonar solve, so it sits on the same
+            // side of the scan-to-map update as the other auxiliary sensors instead of
+            // competing with it. It goes through apply_external_update, which is the identical
+            // Joseph-form update and covariance transport the DVL/pressure/mag updates use.
+            //
+            // Depth for the features comes from THIS scan's undistorted cloud, which is what
+            // makes the recovered translation metric rather than up-to-scale.
+            if (visual_fusion_.enabled())
+            {
+                visual_fusion_.set_depth_cloud(feats_undistort, Measures.lidar_end_time);
+                visual_fusion_.take_measurement(Measures.lidar_end_time, kf, *this);
+                // Un-debiased body-frame gyro drives the camera lever-arm term (omega x p_cam).
+                const V3D raw_gyro =
+                    Measures.imu.empty()
+                        ? V3D::Zero()
+                        : V3D(Measures.imu.back()->angular_velocity.x,
+                              Measures.imu.back()->angular_velocity.y,
+                              Measures.imu.back()->angular_velocity.z);
+                Eigen::VectorXd visual_residual;
+                Eigen::MatrixXd visual_H, visual_R;
+                if (visual_fusion_.build_update(kf.get_x(), raw_gyro,
+                                                visual_residual, visual_H, visual_R))
+                {
+                    aux_fusion_.apply_external_update(visual_residual, visual_H, visual_R, kf);
+                }
+                // Consume it so a measurement is never applied to a second scan.
+                visual_fusion_.clear_measurement();
+            }
+
             const double lidar_update_cov =
                 auxiliary_fusion_enabled ? 1.0 : LASER_POINT_COV_XY;
             kf.update_iterated_dyn_share_modified(lidar_update_cov, solve_H_time);
@@ -1578,6 +1657,9 @@ private:
 
 private:
     AuxiliarySensorFusion aux_fusion_;
+    VisualFusion visual_fusion_;
+    std::string visual_img_topic;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
