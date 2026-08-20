@@ -13,8 +13,8 @@ from launch_ros.actions import Node
 def generate_launch_description():
     package_path = get_package_share_directory('fast_lio')
     package_root_from_launch = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    source_default_config = os.path.join(package_root_from_launch, 'config', 'default.yaml')
-    installed_default_config = os.path.join(package_path, 'config', 'default.yaml')
+    source_default_config = os.path.join(package_root_from_launch, 'config', 'sim.yaml')
+    installed_default_config = os.path.join(package_path, 'config', 'sim.yaml')
     default_config_file = source_default_config if os.path.exists(source_default_config) else installed_default_config
     default_rviz_config_path = os.path.join(
         package_path, 'rviz', 'fastlio.rviz')

@@ -1490,12 +1490,20 @@ private:
 
                 p_imu->Process(Measures, kf, feats_undistort,
                                timed_measurement_stamps, apply_timed_measurement);
-                if (!Measures.imu.empty())
-                {
-                    apply_imu_orientation_update(Measures.imu.back());
-                    apply_accel_attitude_update(Measures.imu.back());
-                }
                 aux_fusion_.warn_timeouts(*this, Measures.lidar_end_time);
+            }
+
+            // Attitude updates belong to the IMU, not to the auxiliary sensors, so they
+            // must run on BOTH branches. Upstream reaches them only inside the else, so
+            // disabling DVL/pressure/magnetometer -- i.e. asking for a sonar-only arm --
+            // silently disabled the AHRS orientation update and gravity levelling too.
+            // On pipe_run1 that is the difference between 4.0 m and 115 m ATE, and it
+            // made mapping.imu_orientation_cov inert: 3.05e-6 and 1.0e-2 gave
+            // byte-identical trajectories.
+            if (!Measures.imu.empty())
+            {
+                apply_imu_orientation_update(Measures.imu.back());
+                apply_accel_attitude_update(Measures.imu.back());
             }
             last_processed_time = Measures.lidar_end_time;
             update_state_outputs();
