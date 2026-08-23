@@ -13,7 +13,7 @@
             lid_topic:  "/sonar_point_cloud"
             imu_topic:  "/auv/imu/data_raw"
             world_frame: "World"
-            world_to_camera_init_T: [ 23.2, 29.0, 0.2 ]
+            world_to_camera_init_T: [ 0.0, 0.0, 0.0 ]
             world_to_camera_init_R: [ 1.0, 0.0, 0.0,
                                       0.0, 1.0, 0.0,
                                       0.0, 0.0, 1.0 ]
@@ -41,7 +41,7 @@
                             -0.258819045, 0.0, 0.965925826 ]
 
         dvl:
-            enable: false
+            enable: true
             topic: "/auv/dvl"
             extrinsic_T: [ -0.079, -0.09691, -0.25938 ]
             extrinsic_R: [ 1., 0., 0.,
@@ -53,7 +53,7 @@
             dvl_timeout: 0.25
 
         pressure:
-            enable: false 
+            enable: true
             topic: "/auv/pressure/scaled2"
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
             pressure_timeout: 0.25
@@ -66,7 +66,7 @@
             gravity: 9.80665
 
         magnetometer:
-            enable: false
+            enable: true
             topic: "/auv/imu/magnetic_field"
             extrinsic_R: [ 1.0, 0.0, 0.0,
                            0.0, 1.0, 0.0,
@@ -91,7 +91,7 @@
         # Disabled by default so this file still describes the sonar-only baseline arm.
         # Enable per-arm with -p visual.enabled:=true.
         visual:
-            enabled: true
+            enabled: false
             img_topic: "/IsaacSim/uw_camera/processed"
 
             # Pinhole intrinsics, verified against the simulator's own camera_info and by
@@ -128,7 +128,7 @@
             # the bag. On pipe_run1 (13.6 Hz sonar, dt ~73 ms) 2.0e-4 gives sigma_v 0.19 m/s
             # and was the measured optimum; the same value on a 46 Hz-visual bag is a
             # different trust level entirely. Tune it as a target sigma_v, not as a constant.
-            position_cov: 0.0001
+            position_cov: 0.05
             innovation_gate_sigma: 3.0
 
         pcd_save:
