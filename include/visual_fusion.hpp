@@ -227,7 +227,13 @@ private:
 #include <cmath>
 #include <limits>
 
+// cv_bridge dropped the .h header after Humble; Iron onwards ship only .hpp.
+// __has_include keeps this compiling on both without a distro check.
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 
 namespace {
 

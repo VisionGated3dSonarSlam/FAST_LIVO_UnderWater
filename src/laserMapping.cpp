@@ -44,7 +44,6 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/version.h>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -1304,16 +1303,7 @@ public:
         else
         {
             auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(200000));
-#if RCLCPP_VERSION_MAJOR >= 21
             lidar_qos.reliability_best_available();
-#else
-            // BEST_AVAILABLE reliability arrived in rclcpp 21 (Iron); Humble ships 16. It
-            // resolves to RELIABLE when every discovered publisher is reliable, which both of
-            // our sources are (the Isaac Sim bridge and `ros2 bag play`), so pin RELIABLE
-            // rather than dropping to BEST_EFFORT, which would silently discard point-cloud
-            // fragments under load.
-            lidar_qos.reliable();
-#endif
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                 lid_topic, lidar_qos, standard_pcl_cbk, lidar_options);
         }
