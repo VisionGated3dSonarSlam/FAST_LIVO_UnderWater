@@ -91,7 +91,7 @@
         # Disabled by default so this file still describes the sonar-only baseline arm.
         # Enable per-arm with -p visual.enabled:=true.
         visual:
-            enabled: true
+            enabled: false
             img_topic: "/IsaacSim/uw_camera/processed"
 
             # Pinhole intrinsics, verified against the simulator's own camera_info and by
