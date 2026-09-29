@@ -18,8 +18,12 @@
                                       0.0, 1.0, 0.0,
                                       0.0, 0.0, 1.0 ]
 
-            imu_rate_hz: 150.0
-            lidar_timeout: 0.25
+            imu_rate_hz: 200.0
+            # Was 0.25s, tuned for the old 13.6 Hz sonar bags (~3.4x the ~0.073s scan period).
+            # test1's bag runs sonar at 4.19 Hz (~0.239s/scan) -- 0.25s left almost no margin,
+            # so ordinary jitter would flip the estimator into IMU-only mode on nearly every
+            # scan. Raised to keep the same ~3.4x margin against the new period.
+            lidar_timeout: 0.8
             gravity_m_s2: 9.8100004196167
 
         preprocess:
@@ -53,7 +57,7 @@
             dvl_timeout: 0.25
 
         pressure:
-            enable: false 
+            enable: false
             topic: "/auv/pressure/scaled2"
             extrinsic_T: [ -0.24219, -0.03954, 0.01898 ]
             pressure_timeout: 0.25
@@ -91,7 +95,7 @@
         # Disabled by default so this file still describes the sonar-only baseline arm.
         # Enable per-arm with -p visual.enabled:=true.
         visual:
-            enabled: false
+            enabled: true
             img_topic: "/IsaacSim/uw_camera/processed"
 
             # Pinhole intrinsics, verified against the simulator's own camera_info and by
@@ -121,13 +125,19 @@
             min_depth_features: 12
             max_reprojection_error_px: 3.0
             max_translation_per_frame_m: 1.0
+            # Frames are only consumed once per lidar scan (visual_fusion.hpp), so this is
+            # effectively gated by the sonar rate too. Was 0.25s against a 0.239s scan period
+            # on test1's bag (4.19 Hz sonar) -- right on the cutoff, dropping frames as stale
+            # on ordinary jitter. Raised for margin while still rejecting genuinely stale ones.
             max_image_dt: 0.25
 
             # position_cov is a per-frame DISPLACEMENT variance; the filter converts it to a
             # velocity variance as cov/dt^2, so the right value depends on the SONAR RATE of
-            # the bag. On pipe_run1 (13.6 Hz sonar, dt ~73 ms) 2.0e-4 gives sigma_v 0.19 m/s
-            # and was the measured optimum; the same value on a 46 Hz-visual bag is a
-            # different trust level entirely. Tune it as a target sigma_v, not as a constant.
+            # the bag (see max_image_dt above -- one visual measurement per scan). On
+            # pipe_run1 (13.6 Hz sonar, dt ~73 ms) 1.0e-4 gave sigma_v 0.19 m/s and was the
+            # measured optimum. test1's bag runs sonar at 4.19 Hz (dt ~239 ms); solving for
+            # the same target sigma_v at that dt gives (0.19*0.239)^2 ~= 2.1e-3. Tune it as a
+            # target sigma_v, not as a constant.
             position_cov: 0.0001
             innovation_gate_sigma: 3.0
 
