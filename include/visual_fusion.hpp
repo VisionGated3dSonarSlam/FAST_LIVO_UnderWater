@@ -27,7 +27,10 @@
 
 #include <deque>
 #include <mutex>
+#include <fstream>
+#include <iomanip>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <Eigen/Core>
@@ -92,6 +95,42 @@ public:
         double position_cov = 0.05;      // metres^2
         double innovation_gate_sigma = 3.0;
 
+        // Which gate decides whether a measurement is used.
+        //   "quality"    : per-measurement quality + a state-independent speed bound (default)
+        //   "innovation" : legacy 3-sigma test on the residual, threshold derived from
+        //                  position_cov -- kept only for A/B comparison
+        //   "none"       : accept everything that survives PnP (calibration runs)
+        //
+        // The innovation gate ties two jobs to one parameter: position_cov sets both the
+        // update weight and the rejection threshold, so trusting vision more also narrows the
+        // gate and throws vision away. It also cannot tell "this measurement is bad" from "my
+        // state is bad" -- the residual is large either way -- so in a diverging run it rejects
+        // good measurements exactly when they are needed. Measured on test6: 64% of
+        // measurements rejected at position_cov 3e-5, and rejections RISING again at 3e-4
+        // despite a 3x wider gate. The quality gate reads only properties of the measurement
+        // itself, so it cannot punish the filter for being lost.
+        std::string gate_mode = "quality";
+        //
+        // Defaults calibrated against ground truth (test2 + test6, gate off, 666 measurements).
+        // Clear-water measurements are already good -- median error 0.05-0.07 m/s, only 5% worse
+        // than 0.3 m/s -- so the within-stream checks are deliberately light: inliers < 20 would
+        // catch 16 of 24 bad measurements but discard 32% of good ones, which is the same trade
+        // the innovation gate made. Turbidity is where the gate earns its keep: semi-turbid
+        // measurements have median error 0.74 m/s and 46 deg direction error, and image quality
+        // separates them from clear by ~20x (sharpness 2.0 vs >=39 at p5; contrast 4.7 vs >=19.5).
+        int gate_min_inliers = 15;           // PnP RANSAC inliers
+        double gate_min_inlier_ratio = 0.0;  // inliers / depth features; 0 disables (uninformative)
+        double gate_max_reproj_px = 1.0;     // mean inlier reprojection error, downscaled px
+        double gate_min_sharpness = 10.0;    // Laplacian variance
+        double gate_min_contrast = 10.0;     // grey-level std-dev
+        double gate_max_speed = 2.0;         // measured camera speed, m/s; 0 disables
+        // Optional loose bound on |residual|. State-DEPENDENT, so off by default: it is the
+        // one check that can reintroduce the failure the quality gate exists to remove.
+        double gate_max_residual = 0.0;
+
+        // Per-measurement CSV for calibrating the thresholds against ground truth.
+        std::string debug_csv;
+
         // Downscale before tracking. The 1920x1080 underwater camera is far higher
         // resolution than feature tracking needs, and the sonar cloud is sparse enough
         // that sub-pixel precision is not the limiting factor.
@@ -110,10 +149,23 @@ public:
         std::uint64_t rejected_pose_failed = 0;
         std::uint64_t rejected_implausible = 0;
         std::uint64_t rejected_innovation_gate = 0;
+        // quality-gate reasons, counted separately so the dominant one is visible
+        std::uint64_t rejected_q_inliers = 0;
+        std::uint64_t rejected_q_ratio = 0;
+        std::uint64_t rejected_q_reproj = 0;
+        std::uint64_t rejected_q_image = 0;
+        std::uint64_t rejected_q_speed = 0;
+        std::uint64_t rejected_residual = 0;
+        // Measurements that came out of PnP. Distinct from updates_applied, which now counts
+        // only what actually reached the filter -- the two used to share one counter, so
+        // every log line reported gate-rejected measurements as "applied".
+        std::uint64_t measurements_produced = 0;
 
         int last_tracked_features = 0;
         int last_depth_features = 0;
         int last_inliers = 0;
+        double last_inlier_ratio = 0.0;
+        double last_reproj_px = 0.0;
         double last_translation_norm = 0.0;
         double last_residual_norm = 0.0;
         /// Speed the camera picks up purely from body rotation about its lever arm,
@@ -220,6 +272,29 @@ private:
     bool has_measurement_ = false;
     V3D measured_cam_velocity_ = V3D::Zero();  ///< camera-frame velocity, metres/second
     double measurement_dt_ = 0.0;
+    double measurement_t_prev_ = 0.0;   ///< image stamps the measurement spans, for the CSV
+    double measurement_t_curr_ = 0.0;
+    std::ofstream debug_csv_;
+
+    /// One row per measurement that came out of PnP, accepted or not. `pred` is null for
+    /// rows rejected before the state was consulted (the quality gate needs no state).
+    void write_csv(bool accepted, const char *reason, const V3D *pred, double residual)
+    {
+        if (!debug_csv_.is_open()) return;
+        const V3D &v = measured_cam_velocity_;
+        debug_csv_ << std::fixed << std::setprecision(6)
+                   << measurement_t_prev_ << ',' << measurement_t_curr_ << ','
+                   << measurement_dt_ << ',' << diagnostics_.last_tracked_features << ','
+                   << diagnostics_.last_depth_features << ',' << diagnostics_.last_inliers << ','
+                   << diagnostics_.last_inlier_ratio << ',' << diagnostics_.last_reproj_px << ','
+                   << diagnostics_.last_sharpness << ',' << diagnostics_.last_contrast << ','
+                   << v.x() << ',' << v.y() << ',' << v.z() << ',' << v.norm() << ',';
+        if (pred) debug_csv_ << pred->x() << ',' << pred->y() << ',' << pred->z() << ',' << residual;
+        else      debug_csv_ << ",,,";
+        debug_csv_ << ',' << (accepted ? 1 : 0) << ',' << reason << '\n';
+        // The node is stopped with SIGKILL, which never flushes the stream buffer.
+        debug_csv_.flush();
+    }
 };
 
 
@@ -309,6 +384,48 @@ inline void VisualFusion::load_parameters(rclcpp::Node &node)
     node.get_parameter_or("visual.innovation_gate_sigma", params_.innovation_gate_sigma,
                           params_.innovation_gate_sigma);
     node.get_parameter_or("visual.image_scale", params_.image_scale, params_.image_scale);
+
+    // The gate parameters are declared here rather than in laserMapping.cpp so the module
+    // stays self-contained. They MUST be declared: an undeclared parameter silently ignores
+    // a -p override and returns the default, which would make an A/B run quietly test the
+    // same thing twice.
+    auto declared = [&node](const std::string &name, auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if (!node.has_parameter(name))
+        {
+            node.declare_parameter<T>(name, value);
+        }
+        node.get_parameter(name, value);
+    };
+    declared("visual.gate_mode", params_.gate_mode);
+    declared("visual.gate_min_inliers", params_.gate_min_inliers);
+    declared("visual.gate_min_inlier_ratio", params_.gate_min_inlier_ratio);
+    declared("visual.gate_max_reproj_px", params_.gate_max_reproj_px);
+    declared("visual.gate_min_sharpness", params_.gate_min_sharpness);
+    declared("visual.gate_min_contrast", params_.gate_min_contrast);
+    declared("visual.gate_max_speed", params_.gate_max_speed);
+    declared("visual.gate_max_residual", params_.gate_max_residual);
+    declared("visual.debug_csv", params_.debug_csv);
+    if (params_.gate_mode != "quality" && params_.gate_mode != "innovation" &&
+        params_.gate_mode != "none")
+    {
+        RCLCPP_WARN(node.get_logger(), "visual.gate_mode '%s' unknown, using 'quality'",
+                    params_.gate_mode.c_str());
+        params_.gate_mode = "quality";
+    }
+    if (params_.enabled && !params_.debug_csv.empty())
+    {
+        debug_csv_.open(params_.debug_csv);
+        debug_csv_ << "t_prev,t_curr,dt,tracked,depth,inliers,inlier_ratio,reproj_px,"
+                      "sharpness,contrast,vx,vy,vz,speed,px,py,pz,residual,accepted,reason\n";
+    }
+    RCLCPP_INFO(node.get_logger(),
+                "VisualFusion gate=%s  min_inliers=%d  min_ratio=%.2f  max_reproj=%.2f px  "
+                "min_sharp=%.1f  min_contrast=%.1f  max_speed=%.2f  max_residual=%.2f",
+                params_.gate_mode.c_str(), params_.gate_min_inliers,
+                params_.gate_min_inlier_ratio, params_.gate_max_reproj_px,
+                params_.gate_min_sharpness, params_.gate_min_contrast,
+                params_.gate_max_speed, params_.gate_max_residual);
     node.get_parameter_or("visual.max_image_dt", params_.max_image_dt, params_.max_image_dt);
 
     params_.image_scale = std::clamp(params_.image_scale, 0.1, 1.0);
@@ -620,6 +737,31 @@ inline bool VisualFusion::estimate_motion(const TrackResult &tracks,
         return false;
     }
 
+    // Fit quality of the accepted solution: how well its own inliers reproject, and what share
+    // of the depth-carrying features agreed with it. Both describe THIS measurement and are
+    // independent of the filter state. Reprojection error is in the downscaled image.
+    {
+        std::vector<cv::Point3f> in_obj;
+        std::vector<cv::Point2f> in_img;
+        in_obj.reserve(inlier_indices.size());
+        in_img.reserve(inlier_indices.size());
+        for (int idx : inlier_indices)
+        {
+            in_obj.push_back(object_points[static_cast<std::size_t>(idx)]);
+            in_img.push_back(image_points[static_cast<std::size_t>(idx)]);
+        }
+        std::vector<cv::Point2f> projected;
+        cv::projectPoints(in_obj, rvec, tvec, camera_matrix, distortion, projected);
+        double sum = 0.0;
+        for (std::size_t k = 0; k < projected.size(); ++k)
+        {
+            sum += cv::norm(projected[k] - in_img[k]);
+        }
+        diagnostics_.last_reproj_px = projected.empty() ? 0.0 : sum / projected.size();
+        diagnostics_.last_inlier_ratio =
+            object_points.empty() ? 0.0 : static_cast<double>(inliers) / object_points.size();
+    }
+
     cv::Mat rotation;
     cv::Rodrigues(rvec, rotation);
 
@@ -664,18 +806,27 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
     // rejecting every frame -- and those two cases look identical from outside.
     RCLCPP_INFO_THROTTLE(
         node.get_logger(), *node.get_clock(), 5000,
-        "visual: rx=%lu proc=%lu applied=%lu | rejects: feat=%lu depth=%lu pnp=%lu "
-        "jump=%lu gate=%lu | last: track=%d depth=%d inl=%d sharp=%.1f contrast=%.1f",
+        "visual[%s]: rx=%lu proc=%lu produced=%lu applied=%lu | rejects: feat=%lu depth=%lu "
+        "pnp=%lu jump=%lu gate=%lu q_inl=%lu q_ratio=%lu q_reproj=%lu q_img=%lu q_speed=%lu "
+        "resid=%lu | last: track=%d depth=%d inl=%d reproj=%.2f sharp=%.1f contrast=%.1f",
+        params_.gate_mode.c_str(),
         static_cast<unsigned long>(diagnostics_.frames_received),
         static_cast<unsigned long>(diagnostics_.frames_processed),
+        static_cast<unsigned long>(diagnostics_.measurements_produced),
         static_cast<unsigned long>(diagnostics_.updates_applied),
         static_cast<unsigned long>(diagnostics_.rejected_few_features),
         static_cast<unsigned long>(diagnostics_.rejected_few_depth),
         static_cast<unsigned long>(diagnostics_.rejected_pose_failed),
         static_cast<unsigned long>(diagnostics_.rejected_implausible),
         static_cast<unsigned long>(diagnostics_.rejected_innovation_gate),
+        static_cast<unsigned long>(diagnostics_.rejected_q_inliers),
+        static_cast<unsigned long>(diagnostics_.rejected_q_ratio),
+        static_cast<unsigned long>(diagnostics_.rejected_q_reproj),
+        static_cast<unsigned long>(diagnostics_.rejected_q_image),
+        static_cast<unsigned long>(diagnostics_.rejected_q_speed),
+        static_cast<unsigned long>(diagnostics_.rejected_residual),
         diagnostics_.last_tracked_features, diagnostics_.last_depth_features,
-        diagnostics_.last_inliers, diagnostics_.last_sharpness,
+        diagnostics_.last_inliers, diagnostics_.last_reproj_px, diagnostics_.last_sharpness,
         diagnostics_.last_contrast);
 
     // Take the newest frame at or before the end of this scan, so the visual measurement
@@ -775,9 +926,44 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
     // does, removes that inconsistency.
     measured_cam_velocity_ = translation_cam / dt;
     measurement_dt_ = dt;
-    has_measurement_ = true;
+    measurement_t_prev_ = stamp - dt;
+    measurement_t_curr_ = stamp;
+    diagnostics_.measurements_produced++;
 
-    diagnostics_.updates_applied++;
+    // Quality gate. Everything here is a property of the measurement, none of it of the
+    // filter state, so it gives the same verdict whether the filter is on track or lost.
+    if (params_.gate_mode == "quality")
+    {
+        const Diagnostics &d = diagnostics_;
+        const char *reason = nullptr;
+        if (inliers < params_.gate_min_inliers)
+        {
+            diagnostics_.rejected_q_inliers++; reason = "inliers";
+        }
+        else if (params_.gate_min_inlier_ratio > 0.0 && d.last_inlier_ratio < params_.gate_min_inlier_ratio)
+        {
+            diagnostics_.rejected_q_ratio++; reason = "ratio";
+        }
+        else if (params_.gate_max_reproj_px > 0.0 && d.last_reproj_px > params_.gate_max_reproj_px)
+        {
+            diagnostics_.rejected_q_reproj++; reason = "reproj";
+        }
+        else if ((params_.gate_min_sharpness > 0.0 && d.last_sharpness < params_.gate_min_sharpness) ||
+                 (params_.gate_min_contrast > 0.0 && d.last_contrast < params_.gate_min_contrast))
+        {
+            diagnostics_.rejected_q_image++; reason = "image";
+        }
+        else if (params_.gate_max_speed > 0.0 && measured_cam_velocity_.norm() > params_.gate_max_speed)
+        {
+            diagnostics_.rejected_q_speed++; reason = "speed";
+        }
+        if (reason)
+        {
+            write_csv(false, reason, nullptr, 0.0);
+            return false;
+        }
+    }
+    has_measurement_ = true;
 
     RCLCPP_DEBUG(node.get_logger(),
                  "visual measurement: %d tracked, %d with depth, %d inliers, |v|=%.3f m/s",
@@ -863,18 +1049,33 @@ inline bool VisualFusion::build_update(const state_ikfom &state,
     // keeping the other two applies a partial correction from an estimate already known to
     // disagree with the state -- and a systematically wrong measurement applied repeatedly
     // drags the filter even when it is heavily down-weighted.
-    if (params_.innovation_gate_sigma > 0.0)
+    if (params_.gate_mode == "innovation" && params_.innovation_gate_sigma > 0.0)
     {
+        // Legacy gate, kept for A/B only. Its threshold is derived from position_cov, so it
+        // changes whenever the update weight does.
         const double limit = params_.innovation_gate_sigma * std::sqrt(cov);
         for (int i = 0; i < 3; ++i)
         {
             if (std::abs(residual[i]) > limit)
             {
                 diagnostics_.rejected_innovation_gate++;
+                write_csv(false, "innovation", &v_cam_pred, residual.norm());
                 return false;
             }
         }
     }
+    else if (params_.gate_mode == "quality" && params_.gate_max_residual > 0.0 &&
+             residual.norm() > params_.gate_max_residual)
+    {
+        diagnostics_.rejected_residual++;
+        write_csv(false, "residual", &v_cam_pred, residual.norm());
+        return false;
+    }
+
+    // Counted HERE, where the measurement is actually handed to the filter. It used to be
+    // counted when the measurement was produced, so gate rejections were reported as applied.
+    diagnostics_.updates_applied++;
+    write_csv(true, "", &v_cam_pred, residual.norm());
 
     residual_out = residual;
     H_out = H_vis;
