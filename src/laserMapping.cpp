@@ -1129,6 +1129,8 @@ public:
         this->declare_parameter<double>("visual.innovation_gate_sigma", 3.0);
         this->declare_parameter<double>("visual.image_scale", 0.5);
         this->declare_parameter<double>("visual.max_image_dt", 0.25);
+        // false restores the old best-effort SensorDataQoS; kept only for A/B comparison.
+        this->declare_parameter<bool>("visual.image_reliable", true);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1318,10 +1320,22 @@ public:
             auto image_cbk = [this](const sensor_msgs::msg::Image::SharedPtr msg) {
                 visual_fusion_.push_image(*msg);
             };
+            // RELIABLE, not SensorDataQoS. A 1920x1080 rgb8 frame is ~6 MB and travels as
+            // ~100 fragments; a best-effort reader discards the whole frame if any single
+            // fragment is lost and nothing is resent. Replaying a bag with a best-effort
+            // reader delivered only 50-73% of camera frames; the same bag with a reliable
+            // reader delivered 100% of all three streams at once. Both the sim bridge and
+            // `ros2 bag play` publish images reliably, so this is compatible with both.
+            // KeepLast bounds the queue so a slow callback drops old frames, not the sim.
+            bool image_reliable = true;
+            this->get_parameter_or<bool>("visual.image_reliable", image_reliable, true);
+            const rclcpp::QoS image_qos = image_reliable
+                ? rclcpp::QoS(rclcpp::KeepLast(10)).reliable()
+                : rclcpp::SensorDataQoS();
             sub_image_ = this->create_subscription<sensor_msgs::msg::Image>(
-                visual_img_topic, rclcpp::SensorDataQoS(), image_cbk, sensor_options);
-            RCLCPP_INFO(this->get_logger(), "Visual fusion subscribing to '%s'",
-                        visual_img_topic.c_str());
+                visual_img_topic, image_qos, image_cbk, sensor_options);
+            RCLCPP_INFO(this->get_logger(), "Visual fusion subscribing to '%s' (%s)",
+                        visual_img_topic.c_str(), image_reliable ? "reliable" : "best effort");
         }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
