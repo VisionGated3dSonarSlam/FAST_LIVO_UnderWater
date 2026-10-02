@@ -42,9 +42,11 @@
 #include <opencv2/video/tracking.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
 #include "common_lib.h"
 #include "use-ikfom.hpp"
+#include "visual_frontend.hpp"
 
 class VisualFusion
 {
@@ -137,6 +139,46 @@ public:
         double image_scale = 0.5;
 
         double max_image_dt = 0.25;      // seconds between usable frames
+        // Reject an image older than this relative to the scan it would be paired with (s).
+        // The newest image at or before the scan is used, which on its own accepts ANY age:
+        // on 2026-10-02 the semi-turbid stream replayed from a second bag lagged ~2.8 s, so
+        // every semi measurement paired an image with sonar depth from a different moment
+        // (65% bad updates) and nothing flagged it. One scan period is a safe limit. 0 disables.
+        double max_image_age = 0.25;
+
+        // ---- front end (2026-10-01 bench: thesis_vio/scripts/frontend_bench.py) ----------
+        // Every default reproduces the original behaviour, so an arm changes only what it sets.
+        //
+        // front_end:
+        //   "gftt"       corners over the whole image, KLT, +-3 px depth lookup (original)
+        //   "gftt_mask"  corners only where a depth lookup can succeed. ~300 corners per frame
+        //                but a median of 18 got depth on t6 clear; masking: 74% -> 95% good.
+        //   "sonar_klt"  track the projected sonar returns themselves: scene-anchored, exact
+        //                depth, no lookup. ~100% good in clear water, 25 ms/pair.
+        std::string front_end = "gftt";
+        // Image used for tracking: "none" | "clahe" | "stretch" | "stretch_clahe". The quality
+        // gate's sharpness/contrast are ALWAYS measured on the raw luminance, so enhancement
+        // does not change what the visibility check sees. Semi-turbid: 8.5% -> 73.6% good.
+        std::string enhance = "none";
+        double clahe_clip = 2.0;
+        // Which scan's sonar cloud supplies depth for the PREVIOUS frame's features:
+        //   "current"  the scan being processed (original; the vehicle has moved ~1 scan since
+        //              the previous image was taken)
+        //   "previous" the scan that was current when the previous image was taken (correct)
+        // sonar_klt always uses "previous": its seeds must come from the previous image.
+        std::string depth_scan = "current";
+        double sonar_seed_spacing_px = 3.0;   // one seed per grid cell, nearest return kept
+        // Minimum Sobel magnitude at a seed (tracking image); 0 = keep every return. Keep 0:
+        // in enhanced turbid frames the strongest gradients are 8-bit quantisation contours,
+        // so filtering on gradient selects exactly the false edges (t6 semi, gyro-gated:
+        // 74.5% good / 2.3% bad at 0 vs 61.3% / 3.2% at 8). The FB check removes flat seeds.
+        double sonar_seed_min_gradient = 0.0;
+        int sonar_seed_max = 1500;
+        // Quality-gate check: reject when the PnP rotation disagrees with the integrated gyro
+        // by more than this (degrees). 0 disables. Strongest bad-measurement predictor on the
+        // bench (Spearman 0.73-0.97 vs ~0.5 for reprojection); at 0.3 it cost ~1% of good
+        // clear-water measurements and cut semi bad measurements to ~3%.
+        double gate_max_gyro_deg = 0.0;
     };
 
     struct Diagnostics
@@ -156,6 +198,10 @@ public:
         std::uint64_t rejected_q_image = 0;
         std::uint64_t rejected_q_speed = 0;
         std::uint64_t rejected_residual = 0;
+        std::uint64_t rejected_q_gyro = 0;
+        std::uint64_t rejected_stale = 0;     ///< image too old for the scan (stream out of sync)
+        double last_image_age = 0.0;          ///< scan end - image stamp, seconds
+        std::uint64_t gyro_unavailable = 0;   ///< gyro check skipped: buffer did not cover dt
         // Measurements that came out of PnP. Distinct from updates_applied, which now counts
         // only what actually reached the filter -- the two used to share one counter, so
         // every log line reported gate-rejected measurements as "applied".
@@ -172,6 +218,9 @@ public:
         /// |omega x p_cam|. Logged so the size of the correction can be read off real runs
         /// and correlated with the turn-time degradation seen in RViz.
         double last_lever_arm_speed = 0.0;
+        /// Angle between the PnP rotation and the integrated-gyro rotation (deg); NaN when
+        /// the gyro buffer did not cover the frame interval.
+        double last_gyro_deg = std::numeric_limits<double>::quiet_NaN();
 
         // Recorded even though nothing acts on it yet: this is the signal the visibility
         // gate will eventually key on, and logging it now means the threshold can be
@@ -189,6 +238,19 @@ public:
 
     /// Buffer an incoming image. Cheap: decoding and tracking happen in process().
     void push_image(const sensor_msgs::msg::Image &msg);
+
+    /// Buffer this scan's gyro samples (body frame), for the PnP-vs-gyro gate check. Call
+    /// every scan BEFORE take_measurement(); duplicate stamps are ignored.
+    void push_imu(const std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> &imu)
+    {
+        if (!params_.enabled) return;
+        for (const auto &m : imu)
+        {
+            if (!m) continue;
+            gyro_.push(rclcpp::Time(m->header.stamp).seconds(),
+                       V3D(m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z));
+        }
+    }
 
     /// Attach the sonar points of the current scan, in sonar frame, for depth lookup.
     void set_depth_cloud(const PointCloudXYZI::Ptr &cloud, double stamp);
@@ -227,7 +289,8 @@ private:
     struct Frame
     {
         double stamp = 0.0;
-        cv::Mat gray;
+        cv::Mat gray;                           ///< tracking image (after enhancement)
+        visual_frontend::Projection projection; ///< sonar scan current when it was taken
     };
 
     /// Tracked-feature correspondences between the previous and current frame.
@@ -235,17 +298,24 @@ private:
     {
         std::vector<cv::Point2f> previous;
         std::vector<cv::Point2f> current;
+        /// Camera-frame 3D point of each `previous` feature when the front end knows it
+        /// exactly (sonar_klt); empty means "look the depth up".
+        std::vector<cv::Point3f> previous_xyz;
     };
 
-    bool decode(const sensor_msgs::msg::Image &msg, cv::Mat &gray) const;
-    TrackResult track(const cv::Mat &previous_gray, const cv::Mat &current_gray) const;
+    /// raw_gray: luminance exactly as before (for the image-quality gate).
+    /// track_gray: what the front end tracks on (equal to raw_gray when enhance == none).
+    bool decode(const sensor_msgs::msg::Image &msg, cv::Mat &raw_gray, cv::Mat &track_gray) const;
+    TrackResult track(const cv::Mat &previous_gray, const cv::Mat &current_gray,
+                      const visual_frontend::Projection &depth_projection) const;
 
-    /// Build a sparse depth image by projecting the sonar cloud into the camera.
-    void build_depth_lookup();
-    std::optional<double> depth_at(const cv::Point2f &pixel) const;
+    /// Project the current sonar cloud into the (downscaled) image.
+    visual_frontend::Projection project_current_cloud();
+    visual_frontend::Intrinsics scaled_intrinsics() const;
 
     /// Recover camera motion from correspondences with known depth (PnP on 3D-2D pairs).
     bool estimate_motion(const TrackResult &tracks,
+                         const visual_frontend::Projection &depth_projection,
                          Eigen::Isometry3d &T_prev_curr,
                          int &inliers);
 
@@ -264,9 +334,8 @@ private:
     Frame previous_frame_;
     bool has_previous_frame_ = false;
 
-    // Sparse depth map in downscaled image coordinates; NaN where no sonar point projects.
-    cv::Mat depth_lookup_;
-    double depth_lookup_scale_ = 1.0;
+    visual_frontend::Enhance enhance_mode_ = visual_frontend::Enhance::None;
+    visual_frontend::GyroBuffer gyro_;
 
     // Measurement carried from take_measurement() to append_joint_measurement_rows().
     bool has_measurement_ = false;
@@ -291,7 +360,8 @@ private:
                    << v.x() << ',' << v.y() << ',' << v.z() << ',' << v.norm() << ',';
         if (pred) debug_csv_ << pred->x() << ',' << pred->y() << ',' << pred->z() << ',' << residual;
         else      debug_csv_ << ",,,";
-        debug_csv_ << ',' << (accepted ? 1 : 0) << ',' << reason << '\n';
+        debug_csv_ << ',' << (accepted ? 1 : 0) << ',' << reason << ','
+                   << diagnostics_.last_gyro_deg << '\n';
         // The node is stopped with SIGKILL, which never flushes the stream buffer.
         debug_csv_.flush();
     }
@@ -406,6 +476,42 @@ inline void VisualFusion::load_parameters(rclcpp::Node &node)
     declared("visual.gate_max_speed", params_.gate_max_speed);
     declared("visual.gate_max_residual", params_.gate_max_residual);
     declared("visual.debug_csv", params_.debug_csv);
+    // Previously hard-coded (never read from parameters); declared so they can be swept.
+    declared("visual.klt_window", params_.klt_window);
+    declared("visual.klt_pyramid_levels", params_.klt_pyramid_levels);
+    declared("visual.front_end", params_.front_end);
+    declared("visual.enhance", params_.enhance);
+    declared("visual.clahe_clip", params_.clahe_clip);
+    declared("visual.depth_scan", params_.depth_scan);
+    declared("visual.sonar_seed_spacing_px", params_.sonar_seed_spacing_px);
+    declared("visual.sonar_seed_min_gradient", params_.sonar_seed_min_gradient);
+    declared("visual.sonar_seed_max", params_.sonar_seed_max);
+    declared("visual.gate_max_gyro_deg", params_.gate_max_gyro_deg);
+    declared("visual.max_image_age", params_.max_image_age);
+    if (params_.front_end != "gftt" && params_.front_end != "gftt_mask" &&
+        params_.front_end != "sonar_klt")
+    {
+        RCLCPP_WARN(node.get_logger(), "visual.front_end '%s' unknown, using 'gftt'",
+                    params_.front_end.c_str());
+        params_.front_end = "gftt";
+    }
+    if (const auto e = visual_frontend::parse_enhance(params_.enhance))
+    {
+        enhance_mode_ = *e;
+    }
+    else
+    {
+        RCLCPP_WARN(node.get_logger(), "visual.enhance '%s' unknown, using 'none'",
+                    params_.enhance.c_str());
+        params_.enhance = "none";
+        enhance_mode_ = visual_frontend::Enhance::None;
+    }
+    if (params_.depth_scan != "current" && params_.depth_scan != "previous")
+    {
+        RCLCPP_WARN(node.get_logger(), "visual.depth_scan '%s' unknown, using 'current'",
+                    params_.depth_scan.c_str());
+        params_.depth_scan = "current";
+    }
     if (params_.gate_mode != "quality" && params_.gate_mode != "innovation" &&
         params_.gate_mode != "none")
     {
@@ -417,15 +523,22 @@ inline void VisualFusion::load_parameters(rclcpp::Node &node)
     {
         debug_csv_.open(params_.debug_csv);
         debug_csv_ << "t_prev,t_curr,dt,tracked,depth,inliers,inlier_ratio,reproj_px,"
-                      "sharpness,contrast,vx,vy,vz,speed,px,py,pz,residual,accepted,reason\n";
+                      "sharpness,contrast,vx,vy,vz,speed,px,py,pz,residual,accepted,reason,gyro_deg\n";
     }
     RCLCPP_INFO(node.get_logger(),
                 "VisualFusion gate=%s  min_inliers=%d  min_ratio=%.2f  max_reproj=%.2f px  "
-                "min_sharp=%.1f  min_contrast=%.1f  max_speed=%.2f  max_residual=%.2f",
+                "min_sharp=%.1f  min_contrast=%.1f  max_speed=%.2f  max_residual=%.2f  "
+                "max_gyro=%.2f deg",
                 params_.gate_mode.c_str(), params_.gate_min_inliers,
                 params_.gate_min_inlier_ratio, params_.gate_max_reproj_px,
                 params_.gate_min_sharpness, params_.gate_min_contrast,
-                params_.gate_max_speed, params_.gate_max_residual);
+                params_.gate_max_speed, params_.gate_max_residual, params_.gate_max_gyro_deg);
+    RCLCPP_INFO(node.get_logger(),
+                "VisualFusion front_end=%s  enhance=%s (clahe_clip %.1f)  depth_scan=%s  "
+                "seeds: spacing %.1f px, min_grad %.1f, max %d  max_image_age=%.3f s",
+                params_.front_end.c_str(), params_.enhance.c_str(), params_.clahe_clip,
+                params_.depth_scan.c_str(), params_.sonar_seed_spacing_px,
+                params_.sonar_seed_min_gradient, params_.sonar_seed_max, params_.max_image_age);
     node.get_parameter_or("visual.max_image_dt", params_.max_image_dt, params_.max_image_dt);
 
     params_.image_scale = std::clamp(params_.image_scale, 0.1, 1.0);
@@ -467,7 +580,8 @@ inline void VisualFusion::set_depth_cloud(const PointCloudXYZI::Ptr &cloud, doub
     depth_cloud_stamp_ = stamp;
 }
 
-inline bool VisualFusion::decode(const sensor_msgs::msg::Image &msg, cv::Mat &gray) const
+inline bool VisualFusion::decode(const sensor_msgs::msg::Image &msg, cv::Mat &raw_gray,
+                                 cv::Mat &track_gray) const
 {
     try
     {
@@ -478,6 +592,7 @@ inline bool VisualFusion::decode(const sensor_msgs::msg::Image &msg, cv::Mat &gr
             return false;
         }
 
+        // Raw luminance, exactly as before: the image-quality gate keeps measuring this.
         cv::Mat mono;
         if (bridge->image.channels() == 3)
         {
@@ -494,14 +609,37 @@ inline bool VisualFusion::decode(const sensor_msgs::msg::Image &msg, cv::Mat &gr
 
         if (params_.image_scale < 0.999)
         {
-            cv::resize(mono, gray, cv::Size(), params_.image_scale, params_.image_scale,
+            cv::resize(mono, raw_gray, cv::Size(), params_.image_scale, params_.image_scale,
                        cv::INTER_AREA);
         }
         else
         {
-            gray = mono.clone();
+            raw_gray = mono.clone();
         }
-        return !gray.empty();
+        if (raw_gray.empty())
+        {
+            return false;
+        }
+
+        if (enhance_mode_ == visual_frontend::Enhance::None)
+        {
+            track_gray = raw_gray;
+            return true;
+        }
+        // Enhancement needs the colour channels (the best one is picked per frame), so it
+        // works from the colour image, downscaled the same way.
+        cv::Mat colour;
+        if (params_.image_scale < 0.999)
+        {
+            cv::resize(bridge->image, colour, cv::Size(), params_.image_scale,
+                       params_.image_scale, cv::INTER_AREA);
+        }
+        else
+        {
+            colour = bridge->image;
+        }
+        track_gray = visual_frontend::enhance(colour, enhance_mode_, params_.clahe_clip);
+        return !track_gray.empty();
     }
     catch (const std::exception &)
     {
@@ -522,163 +660,90 @@ inline void VisualFusion::compute_image_quality(const cv::Mat &gray)
     diagnostics_.last_contrast = stddev[0];
 }
 
-inline VisualFusion::TrackResult VisualFusion::track(const cv::Mat &previous_gray,
-                                              const cv::Mat &current_gray) const
+inline VisualFusion::TrackResult VisualFusion::track(
+    const cv::Mat &previous_gray, const cv::Mat &current_gray,
+    const visual_frontend::Projection &depth_projection) const
 {
     TrackResult result;
 
+    // Forward-backward KLT in both branches: track back to the original frame and keep only
+    // features that return close to where they started. Turbidity produces plenty of
+    // confident but wrong matches in the backscatter, and this rejects them cheaply.
     std::vector<cv::Point2f> previous_points;
-    cv::goodFeaturesToTrack(previous_gray, previous_points, params_.max_features,
-                            params_.feature_quality, params_.min_feature_distance);
+    std::vector<cv::Point3f> previous_xyz;
+    if (params_.front_end == "sonar_klt")
+    {
+        // Seeds are the previous scan's sonar returns as they project into the previous
+        // image: every correspondence is on real structure and carries an exact depth.
+        visual_frontend::select_sonar_seeds(depth_projection, previous_gray,
+                                            params_.sonar_seed_spacing_px,
+                                            params_.sonar_seed_min_gradient,
+                                            params_.sonar_seed_max, previous_points, previous_xyz);
+    }
+    else
+    {
+        // gftt_mask: detect only where a depth lookup can succeed -- elsewhere a corner is
+        // tracked and then thrown away for want of depth.
+        const bool masked = params_.front_end == "gftt_mask" && !depth_projection.lookup_mask.empty();
+        cv::goodFeaturesToTrack(previous_gray, previous_points, params_.max_features,
+                                params_.feature_quality, params_.min_feature_distance,
+                                masked ? depth_projection.lookup_mask : cv::noArray());
+    }
     if (previous_points.empty())
     {
         return result;
     }
 
-    const cv::Size window(params_.klt_window, params_.klt_window);
     std::vector<cv::Point2f> current_points;
-    std::vector<uchar> status;
-    std::vector<float> error;
-    cv::calcOpticalFlowPyrLK(previous_gray, current_gray, previous_points, current_points,
-                             status, error, window, params_.klt_pyramid_levels);
-
-    // Forward-backward check: track back to the original frame and keep only features
-    // that return close to where they started. Turbidity produces plenty of confident but
-    // wrong matches in the backscatter, and this rejects them cheaply.
-    std::vector<cv::Point2f> reverse_points;
-    std::vector<uchar> reverse_status;
-    std::vector<float> reverse_error;
-    cv::calcOpticalFlowPyrLK(current_gray, previous_gray, current_points, reverse_points,
-                             reverse_status, reverse_error, window,
-                             params_.klt_pyramid_levels);
+    const std::vector<uchar> ok = visual_frontend::track_klt(
+        previous_gray, current_gray, previous_points, current_points, params_.klt_window,
+        params_.klt_pyramid_levels, params_.max_fb_error_px);
 
     for (std::size_t i = 0; i < previous_points.size(); ++i)
     {
-        if (!status[i] || !reverse_status[i])
-        {
-            continue;
-        }
-        if (cv::norm(previous_points[i] - reverse_points[i]) > params_.max_fb_error_px)
+        if (!ok[i])
         {
             continue;
         }
         result.previous.push_back(previous_points[i]);
         result.current.push_back(current_points[i]);
+        if (!previous_xyz.empty())
+        {
+            result.previous_xyz.push_back(previous_xyz[i]);
+        }
     }
 
     return result;
 }
 
-inline void VisualFusion::build_depth_lookup()
+inline visual_frontend::Intrinsics VisualFusion::scaled_intrinsics() const
+{
+    const double s = params_.image_scale;
+    return {params_.fx * s, params_.fy * s, params_.cx * s, params_.cy * s,
+            static_cast<int>(params_.image_width * s), static_cast<int>(params_.image_height * s)};
+}
+
+inline visual_frontend::Projection VisualFusion::project_current_cloud()
 {
     PointCloudXYZI::Ptr cloud;
     {
         std::lock_guard<std::mutex> lock(cloud_mutex_);
         cloud = depth_cloud_;
     }
-
-    depth_lookup_scale_ = params_.image_scale;
-    const int width = static_cast<int>(params_.image_width * depth_lookup_scale_);
-    const int height = static_cast<int>(params_.image_height * depth_lookup_scale_);
-    if (width <= 0 || height <= 0)
+    const visual_frontend::Intrinsics k = scaled_intrinsics();
+    if (!cloud)
     {
-        depth_lookup_ = cv::Mat();
-        return;
+        return visual_frontend::build_projection(std::vector<PointType>(),
+                                                 params_.R_cam_sonar, params_.t_cam_sonar, k);
     }
-
-    depth_lookup_ = cv::Mat(height, width, CV_32F,
-                            cv::Scalar(std::numeric_limits<float>::quiet_NaN()));
-    if (!cloud || cloud->empty())
-    {
-        return;
-    }
-
-    const double fx = params_.fx * depth_lookup_scale_;
-    const double fy = params_.fy * depth_lookup_scale_;
-    const double cx = params_.cx * depth_lookup_scale_;
-    const double cy = params_.cy * depth_lookup_scale_;
-
-    for (const auto &point : cloud->points)
-    {
-        const V3D sonar_point(point.x, point.y, point.z);
-        const V3D camera_point = params_.R_cam_sonar * sonar_point + params_.t_cam_sonar;
-
-        // Behind the image plane, or so close the projection is numerically unstable.
-        if (camera_point.z() < 1e-3)
-        {
-            continue;
-        }
-
-        const int u = static_cast<int>(std::lround(fx * camera_point.x() / camera_point.z() + cx));
-        const int v = static_cast<int>(std::lround(fy * camera_point.y() / camera_point.z() + cy));
-        if (u < 0 || u >= width || v < 0 || v >= height)
-        {
-            continue;
-        }
-
-        // Keep the nearest point per pixel: a farther surface seen through the same ray is
-        // occluded, and using it would place the feature at the wrong depth.
-        float &stored = depth_lookup_.at<float>(v, u);
-        const float candidate = static_cast<float>(camera_point.z());
-        if (std::isnan(stored) || candidate < stored)
-        {
-            stored = candidate;
-        }
-    }
-}
-
-inline std::optional<double> VisualFusion::depth_at(const cv::Point2f &pixel) const
-{
-    if (depth_lookup_.empty())
-    {
-        return std::nullopt;
-    }
-
-    const int u = static_cast<int>(std::lround(pixel.x));
-    const int v = static_cast<int>(std::lround(pixel.y));
-
-    // Sonar returns are sparse in image space, so an exact pixel hit is unlikely. Search a
-    // small neighbourhood and take the nearest valid depth.
-    constexpr int kSearchRadius = 3;
-    double best_depth = 0.0;
-    double best_distance = std::numeric_limits<double>::max();
-
-    for (int dv = -kSearchRadius; dv <= kSearchRadius; ++dv)
-    {
-        const int row = v + dv;
-        if (row < 0 || row >= depth_lookup_.rows)
-        {
-            continue;
-        }
-        for (int du = -kSearchRadius; du <= kSearchRadius; ++du)
-        {
-            const int col = u + du;
-            if (col < 0 || col >= depth_lookup_.cols)
-            {
-                continue;
-            }
-            const float value = depth_lookup_.at<float>(row, col);
-            if (std::isnan(value))
-            {
-                continue;
-            }
-            const double distance = std::sqrt(static_cast<double>(du * du + dv * dv));
-            if (distance < best_distance)
-            {
-                best_distance = distance;
-                best_depth = value;
-            }
-        }
-    }
-
-    if (best_distance == std::numeric_limits<double>::max())
-    {
-        return std::nullopt;
-    }
-    return best_depth;
+    // Same rules as the original build_depth_lookup (nearest return per pixel), so the
+    // legacy front end sees an identical depth map.
+    return visual_frontend::build_projection(cloud->points, params_.R_cam_sonar,
+                                             params_.t_cam_sonar, k);
 }
 
 inline bool VisualFusion::estimate_motion(const TrackResult &tracks,
+                                   const visual_frontend::Projection &depth_projection,
                                    Eigen::Isometry3d &T_prev_curr,
                                    int &inliers)
 {
@@ -688,14 +753,23 @@ inline bool VisualFusion::estimate_motion(const TrackResult &tracks,
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
 
-    const double fx = params_.fx * depth_lookup_scale_;
-    const double fy = params_.fy * depth_lookup_scale_;
-    const double cx = params_.cx * depth_lookup_scale_;
-    const double cy = params_.cy * depth_lookup_scale_;
+    const visual_frontend::Intrinsics k = scaled_intrinsics();
+    const double fx = k.fx;
+    const double fy = k.fy;
+    const double cx = k.cx;
+    const double cy = k.cy;
 
     for (std::size_t i = 0; i < tracks.previous.size(); ++i)
     {
-        const std::optional<double> depth = depth_at(tracks.previous[i]);
+        if (!tracks.previous_xyz.empty())
+        {
+            // Exact: the feature IS a sonar return.
+            object_points.push_back(tracks.previous_xyz[i]);
+            image_points.push_back(tracks.current[i]);
+            continue;
+        }
+        const std::optional<double> depth =
+            visual_frontend::depth_at(depth_projection.depth, tracks.previous[i]);
         if (!depth.has_value())
         {
             continue;
@@ -808,7 +882,8 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         node.get_logger(), *node.get_clock(), 5000,
         "visual[%s]: rx=%lu proc=%lu produced=%lu applied=%lu | rejects: feat=%lu depth=%lu "
         "pnp=%lu jump=%lu gate=%lu q_inl=%lu q_ratio=%lu q_reproj=%lu q_img=%lu q_speed=%lu "
-        "resid=%lu | last: track=%d depth=%d inl=%d reproj=%.2f sharp=%.1f contrast=%.1f",
+        "resid=%lu gyro=%lu (n/a %lu) stale=%lu | last: track=%d depth=%d inl=%d reproj=%.2f "
+        "sharp=%.1f contrast=%.1f gyro=%.2fdeg age=%.3fs",
         params_.gate_mode.c_str(),
         static_cast<unsigned long>(diagnostics_.frames_received),
         static_cast<unsigned long>(diagnostics_.frames_processed),
@@ -825,9 +900,12 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         static_cast<unsigned long>(diagnostics_.rejected_q_image),
         static_cast<unsigned long>(diagnostics_.rejected_q_speed),
         static_cast<unsigned long>(diagnostics_.rejected_residual),
+        static_cast<unsigned long>(diagnostics_.rejected_q_gyro),
+        static_cast<unsigned long>(diagnostics_.gyro_unavailable),
+        static_cast<unsigned long>(diagnostics_.rejected_stale),
         diagnostics_.last_tracked_features, diagnostics_.last_depth_features,
         diagnostics_.last_inliers, diagnostics_.last_reproj_px, diagnostics_.last_sharpness,
-        diagnostics_.last_contrast);
+        diagnostics_.last_contrast, diagnostics_.last_gyro_deg, diagnostics_.last_image_age);
 
     // Take the newest frame at or before the end of this scan, so the visual measurement
     // refers to the same instant the filter state has just been propagated to.
@@ -853,20 +931,43 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         return false;
     }
 
+    // A camera stream that lags the sonar still delivers images "at or before" every scan, so
+    // the selection above happily pairs a scan with a seconds-old image. Refuse it loudly.
+    {
+        const double image_stamp = rclcpp::Time(selected.header.stamp).seconds();
+        diagnostics_.last_image_age = scan_end_time - image_stamp;
+        if (params_.max_image_age > 0.0 && diagnostics_.last_image_age > params_.max_image_age)
+        {
+            diagnostics_.rejected_stale++;
+            RCLCPP_WARN_THROTTLE(node.get_logger(), *node.get_clock(), 5000,
+                                 "visual: newest image is %.3f s older than the scan (limit %.3f s) "
+                                 "-- camera stream out of sync with sonar; %lu images rejected",
+                                 diagnostics_.last_image_age, params_.max_image_age,
+                                 static_cast<unsigned long>(diagnostics_.rejected_stale));
+            return false;
+        }
+    }
+
     const double stamp = rclcpp::Time(selected.header.stamp).seconds();
-    cv::Mat gray;
-    if (!decode(selected, gray))
+    cv::Mat raw_gray;
+    cv::Mat gray;  // tracking image
+    if (!decode(selected, raw_gray, gray))
     {
         return false;
     }
 
     diagnostics_.frames_processed++;
-    compute_image_quality(gray);
+    compute_image_quality(raw_gray);
+
+    // This scan's cloud, projected into this image. Kept with the frame so that, next scan,
+    // the previous image's features can be given the depth of the scan they were seen with.
+    visual_frontend::Projection current_projection = project_current_cloud();
 
     if (!has_previous_frame_)
     {
         previous_frame_.stamp = stamp;
         previous_frame_.gray = gray;
+        previous_frame_.projection = std::move(current_projection);
         has_previous_frame_ = true;
         return false;
     }
@@ -878,15 +979,22 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         // motion estimate across the gap.
         previous_frame_.stamp = stamp;
         previous_frame_.gray = gray;
+        previous_frame_.projection = std::move(current_projection);
         return false;
     }
 
-    const TrackResult tracks = track(previous_frame_.gray, gray);
+    const bool use_previous_depth =
+        params_.front_end == "sonar_klt" || params_.depth_scan == "previous";
+    const Frame previous = previous_frame_;  // cheap: cv::Mat headers are shared
+    const visual_frontend::Projection &depth_projection =
+        use_previous_depth ? previous.projection : current_projection;
+
+    const TrackResult tracks = track(previous.gray, gray, depth_projection);
     diagnostics_.last_tracked_features = static_cast<int>(tracks.previous.size());
 
     previous_frame_.stamp = stamp;
-    const cv::Mat previous_gray_for_depth = previous_frame_.gray;
     previous_frame_.gray = gray;
+    previous_frame_.projection = current_projection;
 
     if (static_cast<int>(tracks.previous.size()) < params_.min_tracked_features)
     {
@@ -894,15 +1002,33 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         return false;
     }
 
-    build_depth_lookup();
-
     Eigen::Isometry3d T_prev_curr = Eigen::Isometry3d::Identity();
     int inliers = 0;
-    if (!estimate_motion(tracks, T_prev_curr, inliers))
+    if (!estimate_motion(tracks, depth_projection, T_prev_curr, inliers))
     {
         return false;
     }
     diagnostics_.last_inliers = inliers;
+
+    // PnP rotation vs the gyro integrated over the same interval, both as camera point
+    // transforms. Needs only the gyro bias and the camera<-body extrinsic from the state, not
+    // its attitude or velocity, so it says nothing about whether the FILTER is lost.
+    diagnostics_.last_gyro_deg = std::numeric_limits<double>::quiet_NaN();
+    {
+        const state_ikfom x = kf.get_x();
+        const V3D bg(x.bg[0], x.bg[1], x.bg[2]);
+        if (const auto R_b0_b1 = gyro_.integrate(previous.stamp, stamp, bg))
+        {
+            const M3D R_cam_body = params_.R_cam_sonar * x.offset_R_L_I.toRotationMatrix().transpose();
+            const M3D R_gyro = visual_frontend::camera_rotation_from_body(*R_b0_b1, R_cam_body);
+            diagnostics_.last_gyro_deg =
+                visual_frontend::rotation_angle_deg(T_prev_curr.linear() * R_gyro.transpose());
+        }
+        else
+        {
+            diagnostics_.gyro_unavailable++;
+        }
+    }
 
     const V3D translation_cam = T_prev_curr.translation();
     diagnostics_.last_translation_norm = translation_cam.norm();
@@ -957,6 +1083,11 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
         {
             diagnostics_.rejected_q_speed++; reason = "speed";
         }
+        else if (params_.gate_max_gyro_deg > 0.0 && std::isfinite(d.last_gyro_deg) &&
+                 d.last_gyro_deg > params_.gate_max_gyro_deg)
+        {
+            diagnostics_.rejected_q_gyro++; reason = "gyro";
+        }
         if (reason)
         {
             write_csv(false, reason, nullptr, 0.0);
@@ -970,8 +1101,6 @@ inline bool VisualFusion::take_measurement(double scan_end_time, const Ekf &kf, 
                  diagnostics_.last_tracked_features, diagnostics_.last_depth_features,
                  inliers, measured_cam_velocity_.norm());
 
-    (void)previous_gray_for_depth;
-    (void)kf;
     return true;
 }
 

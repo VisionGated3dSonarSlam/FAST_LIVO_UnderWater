@@ -141,6 +141,24 @@
             position_cov: 0.0001
             innovation_gate_sigma: 3.0
 
+            # Front end (2026-10-01 bench, data/runs/frontend_bench/RESULTS.md). Defaults
+            # reproduce the original behaviour; set per arm with -p visual.<name>:=<value>.
+            #   front_end: gftt | gftt_mask | sonar_klt
+            #   enhance:   none | clahe | stretch | stretch_clahe
+            #   depth_scan: current | previous   (sonar_klt always uses previous)
+            front_end: "gftt"
+            enhance: "none"
+            clahe_clip: 2.0
+            depth_scan: "current"
+            sonar_seed_spacing_px: 3.0
+            sonar_seed_min_gradient: 0.0
+            sonar_seed_max: 1500
+            # PnP-vs-gyro rotation check in the quality gate, degrees; 0 disables.
+            gate_max_gyro_deg: 0.0
+            # Reject an image older than this relative to its scan (s); 0 disables. Catches a
+            # camera stream that lags the sonar (2026-10-02: semi replay lagged ~2.8 s).
+            max_image_age: 0.25
+
         pcd_save:
             pcd_save_en: true
             interval: -1

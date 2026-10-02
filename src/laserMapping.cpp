@@ -1603,6 +1603,9 @@ private:
             if (visual_fusion_.enabled())
             {
                 visual_fusion_.set_depth_cloud(feats_undistort, Measures.lidar_end_time);
+                // Gyro history for the PnP-vs-gyro gate check (spans two image stamps, so
+                // the module keeps its own short buffer; this scan's IMU alone is too short).
+                visual_fusion_.push_imu(Measures.imu);
                 visual_fusion_.take_measurement(Measures.lidar_end_time, kf, *this);
                 // Un-debiased body-frame gyro drives the camera lever-arm term (omega x p_cam).
                 const V3D raw_gyro =
